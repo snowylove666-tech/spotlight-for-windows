@@ -1,0 +1,72 @@
+# 聚焦搜索 SpotlightWin
+
+在 Windows 上使用的「聚焦搜索」：按 `Alt+Space` 唤起，输入关键词，立刻找到应用、文件、文件夹，以及 PDF、Word、Excel、PowerPoint、文本文件里的文字。
+
+![浅色模式](docs/images/light.png)
+![深色模式：按正文搜索](docs/images/dark.png)
+![设置](docs/images/settings.png)
+
+- 毫秒级搜索：本地 SQLite 全文索引，近 10 万个文件时查询仍在 30 毫秒内
+- 低能耗：后台线程使用 Windows 后台模式和 EcoQoS，只做增量更新，用电池时暂停读取正文；隐藏后自动释放内存
+- 中文友好：中文二元分词，任意中文片段都能搜到；自动识别 UTF-8 / UTF-16 / GBK 编码
+- 越用越准：记住你对每个输入选了哪个结果，并参考打开频率和时间
+- 自带计算器：输入 `1280*0.85` 直接出结果
+
+设计细节见 [docs/DESIGN.md](docs/DESIGN.md)。
+
+## 安装与使用
+
+1. 把 `SpotlightWin.exe` 放到任意文件夹（例如 `C:\Tools\SpotlightWin\`），双击运行。不需要安装 .NET。
+2. 首次运行会弹出搜索窗口，同时在后台建立索引，托盘区出现放大镜图标。索引进度显示在窗口底部。
+3. 之后随时按 `Alt+Space` 唤起。托盘图标右键 →「设置…」可以修改快捷键、搜索位置、排除的文件夹和文件类型、开机自动启动。
+4. 某个文件搜不到时，托盘右键 →「检查某个文件为什么搜不到…」，选中文件即可看到原因（不在搜索位置、超过大小上限、正文还在排队等）。
+
+> Windows SmartScreen 可能提示「未知发布者」，因为 exe 没有代码签名。点「更多信息 → 仍要运行」即可。
+
+| 按键 | 作用 |
+| --- | --- |
+| `Alt+Space` | 唤起 / 隐藏 |
+| `↑` `↓` | 选择结果 |
+| `Enter` | 打开（计算结果则复制） |
+| `Ctrl+Enter` | 在资源管理器中显示 |
+| `Ctrl+Shift+C` | 复制路径 |
+| `Esc` | 清空输入，再按一次关闭 |
+
+默认搜索位置：桌面、文档、下载、图片、音乐、视频、OneDrive，以及除系统盘外的所有本地磁盘。设置保存在 `%AppData%\SpotlightWin\settings.json`，索引文件是同目录下的 `index.db`，删掉后会自动重建。
+
+## 从源码构建
+
+需要 [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)。在 PowerShell 中：
+
+```powershell
+# 运行测试
+dotnet test
+
+# 直接运行（调试）
+dotnet run --project src/Spotlight.App
+
+# 打包成单个 exe（输出到 artifacts\win-x64\SpotlightWin.exe）
+dotnet publish src/Spotlight.App -c Release -r win-x64 -o artifacts/win-x64
+```
+
+ARM 版 Windows 设备把 `win-x64` 换成 `win-arm64`。项目在 Linux/macOS 上同样可以编译和跑测试，并能交叉打包 Windows 版。
+
+命令行工具（和桌面版使用同一个引擎）：
+
+```powershell
+dotnet run --project src/Spotlight.Cli -- index D:\资料 --db test.db
+dotnet run --project src/Spotlight.Cli -- search 合同 --db test.db
+dotnet run --project src/Spotlight.Cli -- check D:\资料\某文件.pdf --db test.db
+```
+
+## 项目结构
+
+```
+src/Spotlight.Core     跨平台核心：分词、索引、内容提取、搜索排序
+src/Spotlight.App      Windows 界面：搜索窗口、全局热键、托盘、系统图标
+src/Spotlight.Cli      命令行版
+tests/                 单元测试和端到端测试
+tools/Screenshot       离屏渲染界面截图
+tools/make_icon.py     生成应用图标
+docs/DESIGN.md         设计文档
+```

@@ -1,0 +1,280 @@
+using Microsoft.Data.Sqlite;
+using Spotlight.Core.Indexing;
+
+namespace Spotlight.Core.Search;
+
+public sealed class SearchResult
+{
+    public long Id { get; init; }
+    public required string Path { get; init; }
+    public required string Name { get; init; }
+    public FileKind Kind { get; init; }
+    public long Size { get; init; }
+    public DateTime Modified { get; init; }
+    public double Score { get; set; }
+    /// <summary>True when the query was found in the document text (not only in the name).</summary>
+    public bool ContentMatch { get; set; }
+    public bool NameMatch { get; set; }
+    /// <summary>Text around the first content hit, for display.</summary>
+    public string? Snippet { get; set; }
+    /// <summary>For calculator results: the computed value.</summary>
+    public string? Value { get; init; }
+    internal int LaunchCount { get; init; }
+    internal long LastLaunch { get; init; }
+
+    public override string ToString() => $"{Score,7:F1}  {FileKinds.DisplayName(Kind),-4} {Name}  ({Path})";
+}
+
+/// <summary>
+/// Answers queries against the index. Ranking combines, in order of weight:
+///  how well the file name matches (exact > prefix > word prefix > substring > initials),
+///  what the user opened before for the same query, how often and how recently a file was opened,
+///  the kind of item (apps first), full-text relevance (BM25), modification recency and path depth.
+/// </summary>
+public sealed class SearchEngine : IDisposable
+{
+    private readonly SqliteConnection _conn;
+    private readonly object _lock = new();
+
+    public SearchEngine(string dbPath)
+    {
+        _conn = IndexStore.Open(dbPath, readOnly: true);
+    }
+
+    public List<SearchResult> Search(string query, int limit = 30, CancellationToken ct = default)
+    {
+        query = query.Trim();
+        var results = new List<SearchResult>();
+        if (query.Length == 0) return results;
+
+        if (Calculator.TryEvaluate(query, out var value))
+        {
+            // An arithmetic expression is not a file search; its digits would only match noise.
+            results.Add(new SearchResult { Id = -1, Path = "", Name = $"{query} = {value}", Kind = FileKind.Calculator, Score = 5000, Value = value });
+            return results;
+        }
+
+        var fts = TextTokenizer.ToFtsQuery(query);
+        if (fts == null) return results;
+        var terms = TextTokenizer.QueryTerms(query);
+        string qLower = query.ToLowerInvariant();
+
+        lock (_lock)
+        {
+            var byId = new Dictionary<long, SearchResult>();
+
+            // 1. Candidates by name: FTS token match, plus whole-name prefix via the B-tree index
+            //    (so "a" still finds "a.txt" even when thousands of names contain an "a…" word).
+            var ids = new HashSet<long>();
+            ids.UnionWith(QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 3000;", ("$q", fts)));
+            ids.UnionWith(QueryIds("SELECT id FROM files WHERE name_lower >= $lo AND name_lower < $hi LIMIT 300;", ("$lo", qLower), ("$hi", qLower + '￿')));
+            // Few hits: also try plain substring ("port" inside "report") which token matching can't do.
+            if (ids.Count < 50 && qLower.Length >= 2)
+                ids.UnionWith(QueryIds("SELECT id FROM files WHERE instr(name_lower, $q) > 0 LIMIT 300;", ("$q", qLower)));
+            ct.ThrowIfCancellationRequested();
+
+            foreach (var r in LoadRows(ids)) byId[r.Id] = r;
+            foreach (var r in byId.Values)
+            {
+                r.Score = NameScore(r, qLower, terms);
+                r.NameMatch = r.Score > 0;
+            }
+
+            // 2. Full-text candidates, already ordered by BM25. A single character would match most
+            //    documents and only cost time, so content search starts at two characters.
+            var contentIds = terms.Sum(t => t.Length) < 2 ? new List<long>() : QueryIds("SELECT rowid FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 80;", ("$q", fts));
+            ct.ThrowIfCancellationRequested();
+            var missing = contentIds.Where(id => !byId.ContainsKey(id)).ToList();
+            foreach (var r in LoadRows(missing)) byId[r.Id] = r;
+            for (int i = 0; i < contentIds.Count; i++)
+            {
+                if (!byId.TryGetValue(contentIds[i], out var r)) continue;
+                r.ContentMatch = true;
+                // Content relevance is worth less than a good name match; position in BM25 order decays it.
+                double content = 320 * Math.Pow(0.97, i);
+                r.Score = r.NameMatch ? r.Score + content * 0.35 : content;
+            }
+
+            // 3. Usage: picks for this query (and longer queries starting with it) plus frecency.
+            var picks = LoadPicks(IndexStore.NormalizeQuery(query));
+            long now = DateTime.UtcNow.Ticks;
+            foreach (var r in byId.Values)
+            {
+                if (r.Score <= 0) continue;
+                if (picks.TryGetValue(r.Id, out var pc)) r.Score += Math.Min(450, 220 * Math.Log2(1 + pc));
+                r.Score += Bonus(r, now);
+            }
+
+            var top = byId.Values.Where(r => r.Score > 0)
+                .OrderByDescending(r => r.Score).ThenBy(r => r.Name.Length).ThenBy(r => r.Path, StringComparer.OrdinalIgnoreCase)
+                .Take(limit).ToList();
+
+            foreach (var r in top.Where(r => r.ContentMatch)) r.Snippet = MakeSnippet(r.Id, terms);
+            results.AddRange(top);
+        }
+        return results;
+    }
+
+    // ---------------------------------------------------------------- scoring
+
+    internal static double NameScore(SearchResult r, string q, List<string> terms)
+    {
+        string name = r.Name.ToLowerInvariant();
+        string stem = System.IO.Path.GetFileNameWithoutExtension(name);
+        if (r.Kind == FileKind.Folder || r.Kind == FileKind.App) stem = name;
+        double ratio = Math.Min(1.0, (double)q.Length / Math.Max(1, stem.Length));
+
+        if (stem == q) return 1000;
+        if (name == q) return 980;
+        if (stem.StartsWith(q, StringComparison.Ordinal)) return 800 + 100 * ratio;
+        if (WordPrefix(stem, q)) return 650 + 100 * ratio;
+        if (stem.Contains(q, StringComparison.Ordinal)) return 520 + 80 * ratio;
+        if (terms.Count > 1 && terms.All(t => name.Contains(t, StringComparison.Ordinal))) return 470 + 80 * ratio;
+        if (Initials(r.Name).StartsWith(q, StringComparison.Ordinal) && q.Length >= 2) return 600 + 50 * ratio;
+        if (terms.All(t => name.Contains(t, StringComparison.Ordinal))) return 420;
+        // Matched through tokens only (e.g. the extension "pdf"): weak.
+        return terms.Any(t => name.Contains(t, StringComparison.Ordinal)) ? 200 : 0;
+    }
+
+    private static bool WordPrefix(string name, string q)
+    {
+        for (int i = 1; i < name.Length; i++)
+        {
+            char prev = name[i - 1];
+            bool boundary = !char.IsLetterOrDigit(prev) || TextTokenizer.IsCjk(prev) != TextTokenizer.IsCjk(name[i]);
+            if (boundary && string.CompareOrdinal(name, i, q, 0, q.Length) == 0) return true;
+        }
+        return false;
+    }
+
+    /// <summary>First letters of each word, so "vsc" finds "Visual Studio Code".</summary>
+    internal static string Initials(string name)
+    {
+        var chars = new List<char>();
+        foreach (var word in name.Split(new[] { ' ', '_', '-', '.', '(', ')', '[', ']' }, StringSplitOptions.RemoveEmptyEntries))
+            foreach (var part in TextTokenizer.SplitWordParts(word))
+                if (part.Length > 0 && char.IsLetterOrDigit(part[0])) chars.Add(char.ToLowerInvariant(part[0]));
+        return new string(chars.ToArray());
+    }
+
+    private static double Bonus(SearchResult r, long nowTicks)
+    {
+        double b = r.Kind switch
+        {
+            FileKind.App => 260,
+            FileKind.Folder => 25,
+            FileKind.Pdf or FileKind.Document or FileKind.Spreadsheet or FileKind.Presentation => 40,
+            _ => 0,
+        };
+        // Uninstaller shortcuts are almost never what you want.
+        if (r.Kind == FileKind.App && (r.Name.StartsWith("Uninstall", StringComparison.OrdinalIgnoreCase) || r.Name.StartsWith("卸载")))
+            b -= 400;
+
+        double ageDays = TimeSpan.FromTicks(Math.Max(0, nowTicks - r.Modified.Ticks)).TotalDays;
+        if (ageDays < 7) b += 40;
+        else if (ageDays < 30) b += 20;
+
+        if (r.LaunchCount > 0)
+        {
+            double sinceLaunch = TimeSpan.FromTicks(Math.Max(0, nowTicks - r.LastLaunch)).TotalDays;
+            double decay = Math.Pow(0.5, sinceLaunch / 14); // half-life of two weeks
+            b += Math.Min(300, 120 * Math.Log2(1 + r.LaunchCount) * (0.3 + 0.7 * decay));
+        }
+
+        int depth = r.Path.Count(c => c == System.IO.Path.DirectorySeparatorChar);
+        b -= Math.Min(60, Math.Max(0, depth - 4) * 6);
+        return b;
+    }
+
+    // ---------------------------------------------------------------- data access
+
+    private List<long> QueryIds(string sql, params (string, object)[] args)
+    {
+        using var c = _conn.CreateCommand();
+        c.CommandText = sql;
+        foreach (var (k, v) in args) c.Parameters.AddWithValue(k, v);
+        var list = new List<long>();
+        try
+        {
+            using var r = c.ExecuteReader();
+            while (r.Read()) list.Add(r.GetInt64(0));
+        }
+        catch (SqliteException) { } // malformed FTS expression from unusual input: treat as no match
+        return list;
+    }
+
+    private List<SearchResult> LoadRows(IEnumerable<long> ids)
+    {
+        var list = new List<SearchResult>();
+        foreach (var chunk in ids.Chunk(500))
+        {
+            using var c = _conn.CreateCommand();
+            c.CommandText = $"SELECT id, path, name, kind, size, mtime, launch_count, last_launch FROM files WHERE id IN ({string.Join(',', chunk)});";
+            using var r = c.ExecuteReader();
+            while (r.Read())
+                list.Add(new SearchResult
+                {
+                    Id = r.GetInt64(0),
+                    Path = r.GetString(1),
+                    Name = r.GetString(2),
+                    Kind = (FileKind)r.GetInt32(3),
+                    Size = r.GetInt64(4),
+                    Modified = new DateTime(r.GetInt64(5), DateTimeKind.Utc),
+                    LaunchCount = r.GetInt32(6),
+                    LastLaunch = r.GetInt64(7),
+                });
+        }
+        return list;
+    }
+
+    private Dictionary<long, long> LoadPicks(string normalizedQuery)
+    {
+        var d = new Dictionary<long, long>();
+        if (normalizedQuery.Length == 0) return d;
+        using var c = _conn.CreateCommand();
+        c.CommandText = "SELECT file_id, SUM(count) FROM picks WHERE query >= $lo AND query < $hi GROUP BY file_id;";
+        c.Parameters.AddWithValue("$lo", normalizedQuery);
+        c.Parameters.AddWithValue("$hi", normalizedQuery + '￿');
+        using var r = c.ExecuteReader();
+        while (r.Read()) d[r.GetInt64(0)] = r.GetInt64(1);
+        return d;
+    }
+
+    private string? MakeSnippet(long id, List<string> terms)
+    {
+        using var c = _conn.CreateCommand();
+        c.CommandText = "SELECT data FROM texts WHERE id = $id;";
+        c.Parameters.AddWithValue("$id", id);
+        if (c.ExecuteScalar() is not byte[] data) return null;
+        return Snippet(IndexStore.Decompress(data), terms);
+    }
+
+    internal static string? Snippet(string text, List<string> terms, int radius = 60)
+    {
+        int best = -1, len = 0;
+        foreach (var t in terms)
+        {
+            int i = text.IndexOf(t, StringComparison.OrdinalIgnoreCase);
+            if (i >= 0 && (best < 0 || i < best)) { best = i; len = t.Length; }
+        }
+        if (best < 0) return text.Length > radius * 2 ? text[..(radius * 2)] + "…" : text;
+        int start = Math.Max(0, best - radius);
+        int end = Math.Min(text.Length, best + len + radius);
+        return (start > 0 ? "…" : "") + text[start..end] + (end < text.Length ? "…" : "");
+    }
+
+    public void ReleaseMemory()
+    {
+        lock (_lock)
+        {
+            using var c = _conn.CreateCommand();
+            c.CommandText = "PRAGMA shrink_memory;";
+            c.ExecuteNonQuery();
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_lock) _conn.Dispose();
+    }
+}

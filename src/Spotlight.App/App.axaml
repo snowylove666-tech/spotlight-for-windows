@@ -1,0 +1,32 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="Spotlight.App.App"
+             RequestedThemeVariant="Default">
+  <Application.Styles>
+    <FluentTheme />
+  </Application.Styles>
+  <Application.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Light">
+          <SolidColorBrush x:Key="PanelBrush" Color="#F2F7F7F9" />
+          <SolidColorBrush x:Key="PanelBorderBrush" Color="#33000000" />
+          <SolidColorBrush x:Key="TextPrimary" Color="#1D1D1F" />
+          <SolidColorBrush x:Key="TextSecondary" Color="#6E6E73" />
+          <SolidColorBrush x:Key="DividerBrush" Color="#1A000000" />
+          <SolidColorBrush x:Key="SelectionBrush" Color="#0A64D2" />
+          <SolidColorBrush x:Key="HighlightBrush" Color="#33FFCC00" />
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Dark">
+          <SolidColorBrush x:Key="PanelBrush" Color="#E62A2A2E" />
+          <SolidColorBrush x:Key="PanelBorderBrush" Color="#40FFFFFF" />
+          <SolidColorBrush x:Key="TextPrimary" Color="#F5F5F7" />
+          <SolidColorBrush x:Key="TextSecondary" Color="#A1A1A6" />
+          <SolidColorBrush x:Key="DividerBrush" Color="#26FFFFFF" />
+          <SolidColorBrush x:Key="SelectionBrush" Color="#0A64D2" />
+          <SolidColorBrush x:Key="HighlightBrush" Color="#55FFCC00" />
+        </ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+    </ResourceDictionary>
+  </Application.Resources>
+</Application>

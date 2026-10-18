@@ -1,0 +1,87 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Spotlight.App.SettingsWindow"
+        Title="聚焦搜索 设置"
+        Width="600" Height="720" MinWidth="480" MinHeight="480"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Microsoft YaHei UI, Segoe UI, WenQuanYi Zen Hei, sans-serif">
+  <Window.Styles>
+    <Style Selector="TextBlock.h">
+      <Setter Property="FontSize" Value="15" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Margin" Value="0,18,0,6" />
+    </Style>
+    <Style Selector="TextBlock.hint">
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Opacity" Value="0.65" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+      <Setter Property="Margin" Value="0,0,0,6" />
+    </Style>
+    <Style Selector="ListBox.paths">
+      <Setter Property="Height" Value="120" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="BorderBrush" Value="{DynamicResource DividerBrush}" />
+      <Setter Property="CornerRadius" Value="6" />
+    </Style>
+  </Window.Styles>
+
+  <DockPanel>
+    <Border DockPanel.Dock="Bottom" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource DividerBrush}" Padding="20,12">
+      <Grid ColumnDefinitions="*,Auto,Auto">
+        <TextBlock x:Name="Error" Foreground="#D13438" VerticalAlignment="Center" TextWrapping="Wrap" />
+        <Button x:Name="CancelButton" Grid.Column="1" Content="取消" Margin="8,0" MinWidth="80" HorizontalContentAlignment="Center" />
+        <Button x:Name="SaveButton" Grid.Column="2" Content="保存" Classes="accent" MinWidth="80" HorizontalContentAlignment="Center" />
+      </Grid>
+    </Border>
+
+    <ScrollViewer Padding="24,4,24,20">
+      <StackPanel>
+        <TextBlock Classes="h" Text="快捷键" />
+        <TextBox x:Name="HotkeyBox" Width="220" HorizontalAlignment="Left" Watermark="例如 Alt+Space" />
+        <TextBlock Classes="hint" Text="可用 Ctrl、Alt、Shift、Win 加一个键，例如 Alt+Space、Ctrl+Shift+F、Win+F2。" Margin="0,4,0,0" />
+
+        <TextBlock Classes="h" Text="搜索位置" />
+        <TextBlock x:Name="RootsHint" Classes="hint" />
+        <ListBox x:Name="RootsList" Classes="paths" />
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+          <Button x:Name="AddRoot" Content="添加文件夹或磁盘…" />
+          <Button x:Name="RemoveRoot" Content="移除所选" />
+          <Button x:Name="DefaultRoots" Content="恢复默认" />
+        </StackPanel>
+
+        <TextBlock Classes="h" Text="不搜索这些文件夹" />
+        <TextBlock Classes="hint" Text="文件夹及其中的所有内容都不会被索引。" />
+        <ListBox x:Name="ExcludedList" Classes="paths" Height="90" />
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+          <Button x:Name="AddExcluded" Content="添加文件夹…" />
+          <Button x:Name="RemoveExcluded" Content="移除所选" />
+        </StackPanel>
+
+        <TextBlock Classes="h" Text="文件类型" />
+        <TextBlock Classes="hint" Text="取消勾选的类型不会出现在搜索结果中，也不会被读取。" />
+        <WrapPanel x:Name="KindsPanel" />
+        <TextBlock Classes="hint" Text="另外排除这些扩展名（用逗号分隔）：" Margin="0,10,0,4" />
+        <TextBox x:Name="ExtensionsBox" Watermark="例如 .log, .tmp" />
+
+        <TextBlock Classes="h" Text="文档正文" />
+        <CheckBox x:Name="ContentsCheck" Content="读取文档里的文字（PDF、Word、Excel、PPT、文本等）" />
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+          <TextBlock Text="PDF 大小上限" VerticalAlignment="Center" />
+          <NumericUpDown x:Name="PdfLimit" Minimum="1" Maximum="2000" Increment="10" FormatString="0" Width="130" />
+          <TextBlock Text="MB" VerticalAlignment="Center" />
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+          <TextBlock Text="其他文档上限" VerticalAlignment="Center" />
+          <NumericUpDown x:Name="DocLimit" Minimum="1" Maximum="2000" Increment="5" FormatString="0" Width="130" />
+          <TextBlock Text="MB" VerticalAlignment="Center" />
+        </StackPanel>
+        <CheckBox x:Name="BatteryCheck" Content="使用电池时暂停读取正文（更省电）" Margin="0,6,0,0" />
+        <CheckBox x:Name="FastCheck" Content="插上电源且待读文档较多时，用多核加速（首次建索引快很多）" />
+
+        <TextBlock Classes="h" Text="其他" />
+        <CheckBox x:Name="HiddenCheck" Content="索引隐藏文件" />
+        <CheckBox x:Name="AutostartCheck" Content="开机自动启动" />
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>
