@@ -35,12 +35,23 @@ window.Show();
 window.SetIndexStatus(new IndexStatus(IndexPhase.Idle, store.Counts().files, store.Counts().withContent, 0));
 window.FindControl<TextBox>("Query")!.Text = query;
 
-var until = DateTime.UtcNow.AddSeconds(5);
-while (DateTime.UtcNow < until)
+void Pump(double seconds)
 {
-    Dispatcher.UIThread.RunJobs();
-    AvaloniaHeadlessPlatform.ForceRenderTimerTick();
-    Thread.Sleep(50);
+    var until = DateTime.UtcNow.AddSeconds(seconds);
+    while (DateTime.UtcNow < until)
+    {
+        Dispatcher.UIThread.RunJobs();
+        AvaloniaHeadlessPlatform.ForceRenderTimerTick();
+        Thread.Sleep(50);
+    }
+}
+Pump(5);
+// Optional 5th argument: the result whose name contains this text is selected (to show its preview).
+if (args.Length > 4)
+{
+    var list = window.FindControl<ListBox>("Results")!;
+    list.SelectedItem = list.Items.OfType<ResultItem>().FirstOrDefault(i => i.Name.Contains(args[4]));
+    Pump(8);
 }
 var frame = window.CaptureRenderedFrame();
 frame!.Save(output);

@@ -16,6 +16,7 @@
           <SolidColorBrush x:Key="DividerBrush" Color="#1A000000" />
           <SolidColorBrush x:Key="SelectionBrush" Color="#0A64D2" />
           <SolidColorBrush x:Key="HighlightBrush" Color="#33FFCC00" />
+          <SolidColorBrush x:Key="PageHitBrush" Color="#66FFD400" />
         </ResourceDictionary>
         <ResourceDictionary x:Key="Dark">
           <SolidColorBrush x:Key="PanelBrush" Color="#E62A2A2E" />
@@ -25,6 +26,7 @@
           <SolidColorBrush x:Key="DividerBrush" Color="#26FFFFFF" />
           <SolidColorBrush x:Key="SelectionBrush" Color="#0A64D2" />
           <SolidColorBrush x:Key="HighlightBrush" Color="#55FFCC00" />
+          <SolidColorBrush x:Key="PageHitBrush" Color="#66FFD400" />
         </ResourceDictionary>
       </ResourceDictionary.ThemeDictionaries>
     </ResourceDictionary>

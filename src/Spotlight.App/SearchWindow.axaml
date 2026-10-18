@@ -3,7 +3,7 @@
         xmlns:local="clr-namespace:Spotlight.App"
         x:Class="Spotlight.App.SearchWindow"
         Title="聚焦搜索"
-        Width="760"
+        Width="880"
         SizeToContent="Height"
         CanResize="False"
         ShowInTaskbar="False"
@@ -47,7 +47,8 @@
     </Style>
   </Window.Styles>
 
-  <Border Background="{DynamicResource PanelBrush}"
+  <Border x:Name="Shell"
+          Background="{DynamicResource PanelBrush}"
           BorderBrush="{DynamicResource PanelBorderBrush}"
           BorderThickness="1"
           CornerRadius="14"
@@ -67,7 +68,7 @@
                  FontSize="12" Foreground="#E0A000" />
 
       <!-- Results + preview -->
-      <Grid x:Name="ResultsArea" IsVisible="False" Height="420" ColumnDefinitions="330,1,*">
+      <Grid x:Name="ResultsArea" IsVisible="False" Height="420" ColumnDefinitions="340,1,*">
         <Grid.RowDefinitions>
           <RowDefinition Height="Auto" />
           <RowDefinition Height="*" />
@@ -93,9 +94,19 @@
         <Border Grid.Row="1" Grid.Column="1" Background="{DynamicResource DividerBrush}" />
 
         <!-- Preview of the selected item -->
-        <ScrollViewer Grid.Row="1" Grid.Column="2" Padding="24,20" HorizontalScrollBarVisibility="Disabled">
+        <ScrollViewer x:Name="PreviewScroll" Grid.Row="1" Grid.Column="2" Padding="20,16" HorizontalScrollBarVisibility="Disabled">
           <StackPanel x:Name="Preview" Spacing="10">
-            <Panel HorizontalAlignment="Center" Height="72" Margin="0,8,0,0">
+            <!-- The page / picture itself, with the matched words marked, when the file has one. -->
+            <Border x:Name="PageFrame" IsVisible="False" HorizontalAlignment="Center" Background="White"
+                    BoxShadow="0 1 6 0 #40000000">
+              <Panel>
+                <Image x:Name="PageImage" Stretch="Fill" />
+                <Canvas x:Name="HitLayer" />
+              </Panel>
+            </Border>
+            <TextBlock x:Name="PageLabel" IsVisible="False" FontSize="11" HorizontalAlignment="Center"
+                       Foreground="{DynamicResource TextSecondary}" />
+            <Panel x:Name="IconPanel" HorizontalAlignment="Center" Height="72" Margin="0,8,0,0">
               <Image x:Name="PreviewIcon" Width="64" Height="64" />
               <TextBlock x:Name="PreviewGlyph" FontSize="52" HorizontalAlignment="Center" VerticalAlignment="Center" />
             </Panel>

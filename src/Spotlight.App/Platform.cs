@@ -15,6 +15,81 @@ internal static partial class Platform
         else Process.Start("xdg-open", path);
     }
 
+    /// <summary>Opens a document at the place the query was found when its default program can be told
+    /// where: SumatraPDF / Acrobat / Edge / Chrome jump to the page (Sumatra and Acrobat also search
+    /// for the term); Notepad++ and VS Code jump to the line. Anything else opens normally.</summary>
+    public static void OpenAt(string path, int? page, string? term)
+    {
+        if (!OperatingSystem.IsWindows()) { Open(path); return; }
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        var exe = DefaultProgram(ext);
+        var app = exe == null ? "" : Path.GetFileNameWithoutExtension(exe).ToLowerInvariant();
+        string? args = null;
+        term = string.IsNullOrWhiteSpace(term) ? null : term.Replace("\"", "");
+        if (ext == ".pdf" && page is { } p)
+        {
+            args = app switch
+            {
+                "sumatrapdf" => $"-reuse-instance -page {p}{(term != null ? $" -search \"{term}\"" : "")} \"{path}\"",
+                "acrobat" or "acrord32" => $"/A \"page={p}{(term != null ? "&search=" + term : "")}\" \"{path}\"",
+                "msedge" or "chrome" => $"\"{new Uri(path).AbsoluteUri}#page={p}\"",
+                _ => null,
+            };
+        }
+        else if (term != null && app is "notepad++" or "code" && FirstLine(path, term) is { } line)
+        {
+            args = app == "code" ? $"-g \"{path}:{line}\"" : $"-n{line} \"{path}\"";
+        }
+        if (args == null || exe == null) { Open(path); return; }
+        Process.Start(new ProcessStartInfo(exe, args) { UseShellExecute = false });
+    }
+
+    /// <summary>1-based line of the first occurrence of <paramref name="term"/> in a text file.</summary>
+    private static int? FirstLine(string path, string term)
+    {
+        try
+        {
+            if (new FileInfo(path).Length > 20 * 1024 * 1024) return null;
+            int n = 0;
+            foreach (var line in File.ReadLines(path))
+            {
+                n++;
+                if (line.Contains(term, StringComparison.OrdinalIgnoreCase)) return n;
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        return null;
+    }
+
+    [DllImport("shlwapi.dll", CharSet = CharSet.Unicode)]
+    private static extern int AssocQueryString(int flags, int str, string assoc, string? extra, [Out] char[]? output, ref uint length);
+
+    private const int ASSOCSTR_EXECUTABLE = 2;
+
+    /// <summary>Full path of the program that opens files with this extension, or null.</summary>
+    internal static string? DefaultProgram(string ext)
+    {
+        uint len = 1024;
+        var buf = new char[len];
+        if (AssocQueryString(0, ASSOCSTR_EXECUTABLE, ext, "open", buf, ref len) != 0) return null;
+        var exe = new string(buf, 0, (int)Math.Max(0, len - 1));
+        return File.Exists(exe) ? exe : null;
+    }
+
+    [LibraryImport("dwmapi.dll")]
+    private static partial int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+
+    private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2;
+
+    /// <summary>Lets Windows 11 draw the rounded corners, border and shadow, so the window outline is
+    /// drawn once (our own rounded border on top of Windows' produced a doubled edge at each corner).</summary>
+    public static bool RoundCorners(IntPtr hwnd)
+    {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000) || hwnd == IntPtr.Zero) return false;
+        int pref = DWMWCP_ROUND;
+        return DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref pref, sizeof(int)) == 0;
+    }
+
     public static void Reveal(string path)
     {
         if (OperatingSystem.IsWindows()) Process.Start("explorer.exe", $"/select,\"{path}\"");

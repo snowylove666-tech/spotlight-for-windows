@@ -3,6 +3,10 @@
     <OutputType>WinExe</OutputType>
     <AssemblyName>SpotlightWin</AssemblyName>
     <RootNamespace>Spotlight.App</RootNamespace>
+    <!-- Windows 10 1809+ APIs (Windows.Data.Pdf renders PDF pages for the preview). -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
