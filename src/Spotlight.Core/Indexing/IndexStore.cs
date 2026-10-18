@@ -325,6 +325,21 @@ public sealed class IndexStore : IDisposable
         }
     }
 
+    /// <summary>The documents among <paramref name="ids"/> whose text still has to be read.</summary>
+    public List<PendingContent> PendingContentByIds(IEnumerable<long> ids)
+    {
+        var list = new List<PendingContent>();
+        var all = ids.Distinct().ToList();
+        if (all.Count == 0) return list;
+        lock (_lock)
+        {
+            using var c = Cmd($"SELECT id, path, ext, size, mtime FROM files WHERE id IN ({string.Join(',', all)}) AND wants_content = 1 AND content_mtime <> mtime;");
+            using var r = c.ExecuteReader();
+            while (r.Read()) list.Add(new(r.GetInt64(0), r.GetString(1), r.GetString(2), r.GetInt64(3), r.GetInt64(4)));
+        }
+        return list;
+    }
+
     public int PendingContentCount()
     {
         lock (_lock)

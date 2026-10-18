@@ -139,12 +139,41 @@ public partial class SearchWindow : Window
         }, cts.Token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
     }
 
-    private void ShowResults(List<SearchResult> results)
+    private void ShowResults(List<SearchResult> results, long? keepSelected = null)
     {
         _items.Clear();
         foreach (var r in results) _items.Add(new ResultItem(r));
         ResultsArea.IsVisible = _items.Count > 0;
-        if (_items.Count > 0) Results.SelectedIndex = 0;
+        if (_items.Count > 0)
+        {
+            int keep = keepSelected is { } id ? _items.ToList().FindIndex(i => i.Result.Id == id) : -1;
+            Results.SelectedIndex = Math.Max(0, keep);
+            if (keep > 0) Results.ScrollIntoView(keep);
+        }
+        // Documents found by name whose text hasn't been read yet: read them now rather than after the
+        // whole backlog, so searching their contents works seconds later.
+        var pending = results.Where(r => r.ContentPending).Take(10).Select(r => r.Id).ToList();
+        if (pending.Count > 0) ReadContentSoon?.Invoke(pending);
+    }
+
+    /// <summary>Asks the indexer to read these documents next.</summary>
+    public Action<IReadOnlyList<long>>? ReadContentSoon { get; set; }
+
+    /// <summary>Called when documents asked for with <see cref="ReadContentSoon"/> have been read: if
+    /// any of them is on screen, search again so their text matches show up.</summary>
+    public void ContentArrived(IReadOnlyList<long> ids)
+    {
+        if (!IsVisible || !_items.Any(i => ids.Contains(i.Result.Id))) return;
+        var query = Query.Text ?? "";
+        if (query != _lastQuery || string.IsNullOrWhiteSpace(query)) return;
+        long? selected = (Results.SelectedItem as ResultItem)?.Result.Id;
+        Task.Run(() =>
+        {
+            List<SearchResult> results;
+            try { results = _engine.Search(query, _settings.MaxResults); }
+            catch (Exception) { return; }
+            Dispatcher.UIThread.Post(() => { if (query == _lastQuery && IsVisible) ShowResults(results, selected); });
+        });
     }
 
     private void UpdatePreview()

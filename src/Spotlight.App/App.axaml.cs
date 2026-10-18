@@ -34,6 +34,7 @@ public partial class App : Application
 
         _window = new SearchWindow(_engine, _store, _settings);
         _window.HiddenAway += ScheduleTrim;
+        _window.ReadContentSoon = ids => _indexer.ReadSoon(ids);
         StartIndexer();
         RegisterHotkey();
 
@@ -56,6 +57,7 @@ public partial class App : Application
         indexer.StatusChanged += s => Dispatcher.UIThread.Post(() => { if (indexer == _indexer) _window.SetIndexStatus(s); });
         // Caught up with the disk: if nobody is looking at the window, give memory back.
         indexer.Idle += () => Dispatcher.UIThread.Post(() => { if (!_window.IsVisible) TrimNow(); });
+        indexer.ReadAhead += ids => Dispatcher.UIThread.Post(() => _window.ContentArrived(ids));
         indexer.Start();
     }
 

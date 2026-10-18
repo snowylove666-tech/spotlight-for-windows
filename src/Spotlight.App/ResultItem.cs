@@ -43,9 +43,21 @@ public sealed class ResultItem : INotifyPropertyChanged
         get
         {
             if (Result.Kind == FileKind.Calculator) return "按 Enter 复制结果";
-            if (Result.ContentMatch && !Result.NameMatch && Result.Snippet != null) return Result.Snippet;
+            if (Result.ContentMatch && Result.Snippet != null) return Where + Result.Snippet;
             var parent = Path.GetFileName(Path.GetDirectoryName(Result.Path)) ?? "";
             return $"{FileKinds.DisplayName(Result.Kind)} · {parent}";
+        }
+    }
+
+    /// <summary>"第 496 页等 11 处：" in front of a content snippet.</summary>
+    private string Where
+    {
+        get
+        {
+            var r = Result;
+            string many = r.HitCount > 1 ? $"{(r.Page != null ? "等 " : "")}{r.HitCount} 处" : "";
+            string page = r.Page is { } p ? $"第 {p} 页" : "";
+            return page.Length + many.Length > 0 ? page + many + "：" : "";
         }
     }
 
@@ -59,6 +71,7 @@ public sealed class ResultItem : INotifyPropertyChanged
             var parts = new List<string> { FileKinds.DisplayName(Result.Kind) };
             if (Result.Kind != FileKind.Folder && Result.Kind != FileKind.App) parts.Add(FormatSize(Result.Size));
             parts.Add("修改于 " + Result.Modified.ToLocalTime().ToString("yyyy-MM-dd HH:mm"));
+            if (Result.ContentPending) parts.Add("正文排队中，已优先读取");
             return string.Join("  ·  ", parts);
         }
     }

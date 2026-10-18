@@ -74,6 +74,37 @@ public sealed class Indexer : IDisposable
         _wake.Set();
     }
 
+    private readonly ConcurrentQueue<long> _urgent = new();
+
+    /// <summary>Reads these documents ahead of the backlog (even on battery): the user just searched
+    /// for them by name, so their text is wanted now, not after thousands of others.</summary>
+    public void ReadSoon(IEnumerable<long> ids)
+    {
+        bool any = false;
+        foreach (var id in ids) { _urgent.Enqueue(id); any = true; }
+        if (any) _wake.Set();
+    }
+
+    /// <summary>Raised on the indexer thread after documents passed to <see cref="ReadSoon"/> were read.</summary>
+    public event Action<IReadOnlyList<long>>? ReadAhead;
+
+    private void ReadUrgent(CancellationToken ct)
+    {
+        var ids = new HashSet<long>();
+        while (ids.Count < 32 && _urgent.TryDequeue(out var id)) ids.Add(id);
+        var batch = _store.PendingContentByIds(ids);
+        if (batch.Count == 0) return;
+        var results = new (long, long, string?, string?)[batch.Count];
+        Parallel.For(0, batch.Count, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 2, 1, 4), CancellationToken = ct }, i =>
+        {
+            var text = ExtractSafely(batch[i], ct, out var note);
+            results[i] = (batch[i].Id, batch[i].MTime, text, note);
+        });
+        ct.ThrowIfCancellationRequested();
+        _store.SetContents(results);
+        ReadAhead?.Invoke(batch.Select(b => b.Id).ToList());
+    }
+
     // ---------------------------------------------------------------- main loop
 
     private void Run()
@@ -285,6 +316,7 @@ public sealed class Indexer : IDisposable
         _rate.Restart();
         while (!ct.IsCancellationRequested)
         {
+            while (!_urgent.IsEmpty) ReadUrgent(ct);
             // File changes take priority over the (possibly long) content backlog.
             if (!_changes.IsEmpty || !_rescanRoots.IsEmpty || _fullRescanRequested) return true;
             bool onBattery = PowerAware.OnBattery();
@@ -301,7 +333,8 @@ public sealed class Indexer : IDisposable
                 : 1;
             FastMode = workers > 1;
 
-            var batch = _store.PendingContent(workers * 16);
+            // Small batches, so a document asked for with ReadSoon waits for at most a few others.
+            var batch = _store.PendingContent(workers * 4);
             if (batch.Count == 0) return false;
             Publish(IndexPhase.ReadingContents);
 
@@ -420,7 +453,11 @@ public sealed class Indexer : IDisposable
                 else lines.Add("这是网盘的「仅在线」文件，为避免触发下载没有读取正文。");
             }
         }
-        else if (!rec.ContentRead) lines.Add($"正文还在排队读取（还有 {_store.PendingContentCount():N0} 个文档待读取）。");
+        else if (!rec.ContentRead)
+        {
+            ReadSoon(new[] { rec.Id });
+            lines.Add($"正文还在排队读取（还有 {_store.PendingContentCount():N0} 个文档待读取），已安排立即读取它，稍等片刻即可按正文搜到。");
+        }
         else if (rec.HasContent) lines.Add($"正文已读取 {rec.ContentChars:N0} 个字符。" + (rec.Note != null ? rec.Note + "。" : ""));
         else lines.Add("正文为空：" + (rec.Note ?? "没有可提取的文字"));
         return string.Join("\n", lines);

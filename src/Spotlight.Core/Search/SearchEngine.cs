@@ -18,7 +18,13 @@ public sealed class SearchResult
     /// <summary>Text around the first content hit, for display.</summary>
     public string? Snippet { get; set; }
     /// <summary>PDFs: 1-based page of the first content hit (the extractor ends every page with a newline).</summary>
-    public int? Page { get; set; }    /// <summary>For calculator results: the computed value.</summary>
+    public int? Page { get; set; }
+    /// <summary>How many times the query terms occur in the document text (content hits only).</summary>
+    public int HitCount { get; set; }
+    /// <summary>A document whose text has not been read yet (so a content search can't find it yet).</summary>
+    public bool ContentPending { get; init; }
+    internal int ContentChars { get; init; }
+    /// <summary>For calculator results: the computed value.</summary>
     public string? Value { get; init; }
     internal int LaunchCount { get; init; }
     internal long LastLaunch { get; init; }
@@ -81,20 +87,24 @@ public sealed class SearchEngine : IDisposable
                 r.NameMatch = r.Score > 0;
             }
 
-            // 2. Full-text candidates, already ordered by BM25. A single character would match most
-            //    documents and only cost time, so content search starts at two characters. BM25 ranks a long
-            //    book that mentions a term a few times very low, so take plenty of candidates.
-            var contentIds = terms.Sum(t => t.Length) < 2 ? new List<long>() : QueryIds("SELECT rowid FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 400;", ("$q", fts));
-            ct.ThrowIfCancellationRequested();
-            var missing = contentIds.Where(id => !byId.ContainsKey(id)).ToList();
-            foreach (var r in LoadRows(missing)) byId[r.Id] = r;
-            for (int i = 0; i < contentIds.Count; i++)
+            // 2. Full-text candidates in BM25 order. A single character would match most documents and
+            //    only cost time, so content search starts at two characters.
+            if (terms.Sum(t => t.Length) >= 2)
             {
-                if (!byId.TryGetValue(contentIds[i], out var r)) continue;
-                r.ContentMatch = true;
-                // Content relevance is worth less than a good name match; position in BM25 order decays it.
-                double content = 120 + 200 * Math.Pow(0.97, i);
-                r.Score = r.NameMatch ? r.Score + content * 0.35 : content;
+                var hits = QueryHits("SELECT rowid, bm25(content_fts) FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 1000;", fts);
+                ct.ThrowIfCancellationRequested();
+                foreach (var r in LoadRows(hits.Select(h => h.id).Where(id => !byId.ContainsKey(id)))) byId[r.Id] = r;
+                var scores = ContentScores(hits, byId, terms.Count == 1 ? fts : null);
+                for (int i = 0; i < hits.Count; i++)
+                {
+                    if (!byId.TryGetValue(hits[i].id, out var r)) continue;
+                    r.ContentMatch = true;
+                    // Content relevance is worth less than a good name match.
+                    r.Score = r.NameMatch ? r.Score + scores[i] * 0.35 : scores[i];
+                }
+
+                // 2b. Some words in the name, the rest in the text ("课件 弗里德曼").
+                if (terms.Count > 1) AddNamePlusContent(terms, byId, ct);
             }
 
             // 3. Usage: picks for this query (and longer queries starting with it) plus frecency.
@@ -118,6 +128,92 @@ public sealed class SearchEngine : IDisposable
     }
 
     // ---------------------------------------------------------------- scoring
+
+    private (long n, double avgChars, DateTime at) _corpus;
+
+    /// <summary>
+    /// Content score (120..340) for each BM25 hit. BM25 divides by document length, so a 1000-page
+    /// course book that mentions a name eleven times ranks below hundreds of one-page notes that
+    /// mention it once. For single-term queries the term frequency is recovered from the BM25 score
+    /// (its formula is known; only the document length is approximated by its character count) and the
+    /// score grows with the number of mentions instead. Other queries keep BM25 order.
+    /// </summary>
+    private double[] ContentScores(List<(long id, double bm25)> hits, Dictionary<long, SearchResult> byId, string? singleTermFts)
+    {
+        var scores = new double[hits.Count];
+        for (int i = 0; i < hits.Count; i++) scores[i] = 120 + 200 * Math.Pow(0.97, i);
+        if (singleTermFts == null || hits.Count == 0) return scores;
+
+        if (_corpus.n == 0 || DateTime.UtcNow - _corpus.at > TimeSpan.FromMinutes(5))
+        {
+            using var c = _conn.CreateCommand();
+            c.CommandText = "SELECT COUNT(*), AVG(content_chars) FROM files WHERE has_content = 1;";
+            using var r = c.ExecuteReader();
+            if (r.Read()) _corpus = (r.GetInt64(0), r.IsDBNull(1) ? 0 : r.GetDouble(1), DateTime.UtcNow);
+        }
+        long matching = hits.Count < 1000 ? hits.Count : Count("SELECT COUNT(*) FROM content_fts WHERE content_fts MATCH $q;", singleTermFts);
+        // Same IDF as SQLite's bm25(), including its floor for terms found in most documents.
+        double idf = Math.Max(1e-6, Math.Log((_corpus.n - matching + 0.5) / (matching + 0.5)));
+        if (_corpus.avgChars <= 0) return scores;
+        double best = hits.Max(h => -h.bm25);
+        for (int i = 0; i < hits.Count; i++)
+        {
+            if (!byId.TryGetValue(hits[i].id, out var row)) continue;
+            double tf = EstimateTermFrequency(-hits[i].bm25 / idf, row.ContentChars / _corpus.avgChars);
+            double mentions = Math.Min(1, Math.Log2(1 + tf) / Math.Log2(17)); // 16+ mentions: full marks
+            scores[i] = 120 + 200 * mentions + 20 * (-hits[i].bm25 / best);
+        }
+        return scores;
+    }
+
+    /// <summary>Inverts BM25 (k1 = 1.2, b = 0.75) for one term: <paramref name="r"/> is score / idf,
+    /// <paramref name="relativeLength"/> the document length over the average.</summary>
+    internal static double EstimateTermFrequency(double r, double relativeLength)
+    {
+        const double k1 = 1.2, b = 0.75;
+        double k = k1 * (1 - b + b * Math.Max(0, relativeLength));
+        r = Math.Clamp(r, 0, (k1 + 1) * 0.98);
+        return Math.Max(1, r * k / (k1 + 1 - r));
+    }
+
+    /// <summary>Documents whose name holds some query terms and whose text holds the others.</summary>
+    private void AddNamePlusContent(List<string> terms, Dictionary<long, SearchResult> byId, CancellationToken ct)
+    {
+        var byRest = new Dictionary<string, List<long>>();
+        var rows = new Dictionary<long, SearchResult>();
+        foreach (var t in terms)
+        {
+            var nameFts = TextTokenizer.ToFtsQuery(t);
+            if (nameFts == null) continue;
+            foreach (var r in LoadRows(QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 2000;", ("$q", nameFts)).Where(id => !rows.ContainsKey(id))))
+                rows[r.Id] = r;
+        }
+        foreach (var r in rows.Values)
+        {
+            if (byId.TryGetValue(r.Id, out var known) && (known.ContentMatch || known.Score >= 420)) continue;
+            var name = r.Name.ToLowerInvariant();
+            var rest = terms.Where(t => !name.Contains(t, StringComparison.Ordinal)).ToList();
+            if (rest.Count == 0 || rest.Count == terms.Count) continue;
+            var key = string.Join(' ', rest);
+            if (!byRest.TryGetValue(key, out var list)) byRest[key] = list = new List<long>();
+            list.Add(r.Id);
+        }
+        foreach (var (rest, ids) in byRest)
+        {
+            ct.ThrowIfCancellationRequested();
+            var restFts = TextTokenizer.ToFtsQuery(rest);
+            if (restFts == null) continue;
+            foreach (var chunk in ids.Chunk(500))
+                foreach (var id in QueryIds($"SELECT rowid FROM content_fts WHERE content_fts MATCH $q AND rowid IN ({string.Join(',', chunk)});", ("$q", restFts)))
+                {
+                    var r = byId.TryGetValue(id, out var known) ? known : byId[id] = rows[id];
+                    r.ContentMatch = true;
+                    r.NameMatch = true;
+                    // Below a name holding every term, above most text-only hits.
+                    r.Score = Math.Max(r.Score, 380);
+                }
+        }
+    }
 
     internal static double NameScore(SearchResult r, string q, List<string> terms)
     {
@@ -205,13 +301,37 @@ public sealed class SearchEngine : IDisposable
         return list;
     }
 
+    private List<(long id, double bm25)> QueryHits(string sql, string fts)
+    {
+        using var c = _conn.CreateCommand();
+        c.CommandText = sql;
+        c.Parameters.AddWithValue("$q", fts);
+        var list = new List<(long, double)>();
+        try
+        {
+            using var r = c.ExecuteReader();
+            while (r.Read()) list.Add((r.GetInt64(0), r.GetDouble(1)));
+        }
+        catch (SqliteException) { } // malformed FTS expression from unusual input: treat as no match
+        return list;
+    }
+
+    private long Count(string sql, string fts)
+    {
+        using var c = _conn.CreateCommand();
+        c.CommandText = sql;
+        c.Parameters.AddWithValue("$q", fts);
+        try { return Convert.ToInt64(c.ExecuteScalar()); }
+        catch (SqliteException) { return 0; }
+    }
+
     private List<SearchResult> LoadRows(IEnumerable<long> ids)
     {
         var list = new List<SearchResult>();
         foreach (var chunk in ids.Chunk(500))
         {
             using var c = _conn.CreateCommand();
-            c.CommandText = $"SELECT id, path, name, kind, size, mtime, launch_count, last_launch FROM files WHERE id IN ({string.Join(',', chunk)});";
+            c.CommandText = $"SELECT id, path, name, kind, size, mtime, launch_count, last_launch, content_chars, wants_content = 1 AND content_mtime <> mtime FROM files WHERE id IN ({string.Join(',', chunk)});";
             using var r = c.ExecuteReader();
             while (r.Read())
                 list.Add(new SearchResult
@@ -224,6 +344,8 @@ public sealed class SearchEngine : IDisposable
                     Modified = new DateTime(r.GetInt64(5), DateTimeKind.Utc),
                     LaunchCount = r.GetInt32(6),
                     LastLaunch = r.GetInt64(7),
+                    ContentChars = r.GetInt32(8),
+                    ContentPending = r.GetInt64(9) == 1,
                 });
         }
         return list;
@@ -250,10 +372,21 @@ public sealed class SearchEngine : IDisposable
         if (c.ExecuteScalar() is not byte[] data) return;
         var text = IndexStore.Decompress(data);
         r.Snippet = Snippet(text, terms);
+        r.HitCount = CountHits(text, terms);
         // Indexes built before 0.4.0 kept no newlines; the app then looks the page up in the PDF itself.
         if (r.Kind != FileKind.Pdf || text.IndexOf('\n') < 0) return;
         int at = FirstHit(text, terms, out _);
         if (at >= 0) r.Page = 1 + text.AsSpan(0, at).Count('\n');
+    }
+
+    /// <summary>Occurrences of the terms in the text, for "11 处" in the result list.</summary>
+    internal static int CountHits(string text, List<string> terms)
+    {
+        int n = 0;
+        foreach (var t in terms.Where(t => t.Length > 0))
+            for (int i = text.IndexOf(t, StringComparison.OrdinalIgnoreCase); i >= 0; i = text.IndexOf(t, i + t.Length, StringComparison.OrdinalIgnoreCase))
+                n++;
+        return n;
     }
 
     internal static int FirstHit(string text, List<string> terms, out int length)
