@@ -17,7 +17,8 @@ public sealed class SearchResult
     public bool NameMatch { get; set; }
     /// <summary>Text around the first content hit, for display.</summary>
     public string? Snippet { get; set; }
-    /// <summary>For calculator results: the computed value.</summary>
+    /// <summary>PDFs: 1-based page of the first content hit (the extractor ends every page with a newline).</summary>
+    public int? Page { get; set; }    /// <summary>For calculator results: the computed value.</summary>
     public string? Value { get; init; }
     internal int LaunchCount { get; init; }
     internal long LastLaunch { get; init; }
@@ -41,7 +42,7 @@ public sealed class SearchEngine : IDisposable
         _conn = IndexStore.Open(dbPath, readOnly: true);
     }
 
-    public List<SearchResult> Search(string query, int limit = 30, CancellationToken ct = default)
+    public List<SearchResult> Search(string query, int limit = 60, CancellationToken ct = default)
     {
         query = query.Trim();
         var results = new List<SearchResult>();
@@ -81,8 +82,9 @@ public sealed class SearchEngine : IDisposable
             }
 
             // 2. Full-text candidates, already ordered by BM25. A single character would match most
-            //    documents and only cost time, so content search starts at two characters.
-            var contentIds = terms.Sum(t => t.Length) < 2 ? new List<long>() : QueryIds("SELECT rowid FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 80;", ("$q", fts));
+            //    documents and only cost time, so content search starts at two characters. BM25 ranks a long
+            //    book that mentions a term a few times very low, so take plenty of candidates.
+            var contentIds = terms.Sum(t => t.Length) < 2 ? new List<long>() : QueryIds("SELECT rowid FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 400;", ("$q", fts));
             ct.ThrowIfCancellationRequested();
             var missing = contentIds.Where(id => !byId.ContainsKey(id)).ToList();
             foreach (var r in LoadRows(missing)) byId[r.Id] = r;
@@ -91,7 +93,7 @@ public sealed class SearchEngine : IDisposable
                 if (!byId.TryGetValue(contentIds[i], out var r)) continue;
                 r.ContentMatch = true;
                 // Content relevance is worth less than a good name match; position in BM25 order decays it.
-                double content = 320 * Math.Pow(0.97, i);
+                double content = 120 + 200 * Math.Pow(0.97, i);
                 r.Score = r.NameMatch ? r.Score + content * 0.35 : content;
             }
 
@@ -109,7 +111,7 @@ public sealed class SearchEngine : IDisposable
                 .OrderByDescending(r => r.Score).ThenBy(r => r.Name.Length).ThenBy(r => r.Path, StringComparer.OrdinalIgnoreCase)
                 .Take(limit).ToList();
 
-            foreach (var r in top.Where(r => r.ContentMatch)) r.Snippet = MakeSnippet(r.Id, terms);
+            foreach (var r in top.Where(r => r.ContentMatch)) FillHit(r, terms);
             results.AddRange(top);
         }
         return results;
@@ -240,27 +242,44 @@ public sealed class SearchEngine : IDisposable
         return d;
     }
 
-    private string? MakeSnippet(long id, List<string> terms)
+    private void FillHit(SearchResult r, List<string> terms)
     {
         using var c = _conn.CreateCommand();
         c.CommandText = "SELECT data FROM texts WHERE id = $id;";
-        c.Parameters.AddWithValue("$id", id);
-        if (c.ExecuteScalar() is not byte[] data) return null;
-        return Snippet(IndexStore.Decompress(data), terms);
+        c.Parameters.AddWithValue("$id", r.Id);
+        if (c.ExecuteScalar() is not byte[] data) return;
+        var text = IndexStore.Decompress(data);
+        r.Snippet = Snippet(text, terms);
+        // Indexes built before 0.4.0 kept no newlines; the app then looks the page up in the PDF itself.
+        if (r.Kind != FileKind.Pdf || text.IndexOf('\n') < 0) return;
+        int at = FirstHit(text, terms, out _);
+        if (at >= 0) r.Page = 1 + text.AsSpan(0, at).Count('\n');
+    }
+
+    internal static int FirstHit(string text, List<string> terms, out int length)
+    {
+        int best = -1;
+        length = 0;
+        foreach (var t in terms)
+        {
+            int i = text.IndexOf(t, StringComparison.OrdinalIgnoreCase);
+            if (i >= 0 && (best < 0 || i < best)) { best = i; length = t.Length; }
+        }
+        return best;
     }
 
     internal static string? Snippet(string text, List<string> terms, int radius = 60)
     {
-        int best = -1, len = 0;
-        foreach (var t in terms)
+        int best = FirstHit(text, terms, out int len);
+        string s;
+        if (best < 0) s = text.Length > radius * 2 ? text[..(radius * 2)] + "…" : text;
+        else
         {
-            int i = text.IndexOf(t, StringComparison.OrdinalIgnoreCase);
-            if (i >= 0 && (best < 0 || i < best)) { best = i; len = t.Length; }
+            int start = Math.Max(0, best - radius);
+            int end = Math.Min(text.Length, best + len + radius);
+            s = (start > 0 ? "…" : "") + text[start..end] + (end < text.Length ? "…" : "");
         }
-        if (best < 0) return text.Length > radius * 2 ? text[..(radius * 2)] + "…" : text;
-        int start = Math.Max(0, best - radius);
-        int end = Math.Min(text.Length, best + len + radius);
-        return (start > 0 ? "…" : "") + text[start..end] + (end < text.Length ? "…" : "");
+        return s.Replace('\n', ' ');
     }
 
     public void ReleaseMemory()

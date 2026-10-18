@@ -373,13 +373,19 @@ public sealed class IndexStore : IDisposable
 
     internal static string NormalizeWhitespace(string s)
     {
+        // Every newline is kept: in PDF text each one ends a page, so a hit's page is the number of
+        // newlines before it plus one. Other whitespace runs become a single space.
         var sb = new StringBuilder(s.Length);
         bool ws = false;
+        int newlines = 0;
         foreach (var ch in s)
         {
+            if (ch == '\n') { newlines++; continue; }
             if (char.IsWhiteSpace(ch) || char.IsControl(ch)) { ws = true; continue; }
-            if (ws && sb.Length > 0) sb.Append(' ');
+            if (newlines > 0) sb.Append('\n', newlines);
+            else if (ws && sb.Length > 0) sb.Append(' ');
             ws = false;
+            newlines = 0;
             sb.Append(ch);
         }
         return sb.ToString();

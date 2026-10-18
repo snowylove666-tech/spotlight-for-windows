@@ -146,7 +146,7 @@ public sealed class Indexer : IDisposable
                     {
                         if (_excludedNames.Contains(d.Name) || IsExcludedPath(d.FullName)) continue;
                         // Don't follow junctions/symlinks: they create loops and duplicate trees.
-                        if ((d.Attributes & FileAttributes.ReparsePoint) == 0) stack.Push(d);
+                        if (!IsLink(d)) stack.Push(d);
                     }
                     else if (_settings.IsExcludedFile(e.Extension)) continue;
                     _store.Upsert(e, gen);
@@ -163,6 +163,15 @@ public sealed class Indexer : IDisposable
         }
         finally { _store.CommitBatch(); }
         _store.DeleteStale(root, gen);
+    }
+
+    /// <summary>True for junctions and symbolic links. Other reparse points are real folders: cloud sync
+    /// roots (Baidu Netdisk sync disk, OneDrive, iCloud) mark every folder as one, and must be crawled.</summary>
+    internal static bool IsLink(DirectoryInfo d)
+    {
+        if ((d.Attributes & FileAttributes.ReparsePoint) == 0) return false;
+        try { return d.LinkTarget != null; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return true; }
     }
 
     // Enumeration can throw midway (folder deleted, permissions changed); skip the rest of that folder.

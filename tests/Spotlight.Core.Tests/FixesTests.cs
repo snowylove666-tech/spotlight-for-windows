@@ -114,6 +114,7 @@ public sealed class FixesTests : IDisposable
         Assert.Equal(300, s.MaxPdfFileSizeMB);
         Assert.Equal(5_000_000, s.MaxContentChars);
         Assert.Contains("Program Files", s.ExcludedDirNames);
-        Assert.Contains("\"SettingsVersion\": 2", File.ReadAllText(path));
+        Assert.Equal(60, s.MaxResults);
+        Assert.Contains("\"SettingsVersion\": 3", File.ReadAllText(path));
     }
 }

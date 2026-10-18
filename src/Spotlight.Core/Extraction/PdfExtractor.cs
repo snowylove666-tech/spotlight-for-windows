@@ -49,6 +49,8 @@ public sealed class PdfExtractor : IContentExtractor
     internal static void AppendWord(StringBuilder sb, string word)
     {
         if (word.Length == 0) return;
+        // A newline marks the end of a page (search results use it to find the page of a hit).
+        if (word.AsSpan().IndexOfAny('\n', '\r') >= 0) word = word.Replace('\n', ' ').Replace('\r', ' ');
         if (sb.Length > 0)
         {
             char prev = sb[^1];

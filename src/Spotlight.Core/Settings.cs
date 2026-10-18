@@ -5,7 +5,7 @@ namespace Spotlight.Core;
 
 public sealed class Settings
 {
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 3;
 
     /// <summary>Format version of this file; older files are upgraded on load.</summary>
     public int SettingsVersion { get; set; } = 1; // files from 0.1.0 have no version field
@@ -53,7 +53,7 @@ public sealed class Settings
 
     public bool IndexHiddenFiles { get; set; } = false;
 
-    public int MaxResults { get; set; } = 30;
+    public int MaxResults { get; set; } = 60;
 
     [JsonIgnore] public string? FilePath { get; private set; }
 
@@ -122,6 +122,11 @@ public sealed class Settings
             if (MaxContentChars == 1_000_000) MaxContentChars = 5_000_000;
             foreach (var name in new Settings().ExcludedDirNames)
                 if (!ExcludedDirNames.Contains(name, StringComparer.OrdinalIgnoreCase)) ExcludedDirNames.Add(name);
+        }
+        if (SettingsVersion < 3)
+        {
+            // 30 results hid long courseware that mentions a term only a few times.
+            if (MaxResults == 30) MaxResults = 60;
         }
         SettingsVersion = CurrentVersion;
         return true;
