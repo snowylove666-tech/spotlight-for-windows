@@ -1,6 +1,10 @@
-# 聚焦搜索 SpotlightWin
+# 聚焦搜索 SpotlightWin — Spotlight for Windows
 
-在 Windows 上使用的「聚焦搜索」：按 `Alt+Space` 唤起，输入关键词，立刻找到应用、文件、文件夹，以及 PDF、Word、Excel、PowerPoint、文本文件里的文字。
+在 Windows 上使用的「聚焦搜索」：按 `Alt+Space` 唤起，输入关键词，立刻找到应用、文件、文件夹，以及 PDF、Word、PowerPoint、文本文件里的文字；右侧直接预览命中的那一页，回车打开并跳到该页。
+
+**[⬇ 下载最新版 SpotlightWin.exe](https://github.com/snowylove666-tech/spotlight-for-windows/releases/latest)**：单个 exe，免安装，无需 .NET，Windows 10/11 x64。
+
+> **English:** A macOS Spotlight–style launcher and desktop search for Windows. Press `Alt+Space` to instantly find apps, files and the text inside PDF / Word / PowerPoint documents (Chinese supported), preview the matching page with highlights, and open it right at that page. Fully local and private; a single portable exe built with C# / .NET 10, Avalonia and SQLite FTS5.
 
 ![浅色模式](docs/images/light.png)
 ![深色模式：按正文搜索](docs/images/dark.png)
