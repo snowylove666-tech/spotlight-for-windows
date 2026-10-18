@@ -82,6 +82,8 @@ public sealed class IndexStore : IDisposable
             // Schema changed between releases: the index is a cache, so rebuild it from scratch.
             Exec(_conn, "DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS names_fts; DROP TABLE IF EXISTS content_fts; DROP TABLE IF EXISTS texts; DROP TABLE IF EXISTS meta;");
         }
+        // New indexes can hand freed pages back to the file system (see ReleaseSpace).
+        if (version == 0) Exec(_conn, "PRAGMA auto_vacuum = INCREMENTAL;");
         Exec(_conn, $"""
             CREATE TABLE IF NOT EXISTS files(
                 id INTEGER PRIMARY KEY,
@@ -161,7 +163,7 @@ public sealed class IndexStore : IDisposable
         long mtime = info.LastWriteTimeUtc.Ticks;
         var kind = isDir ? FileKind.Folder : ClassifyFile(path, ext);
         string display = DisplayName(info.Name, ext, kind);
-        bool wants = WantsContent(ext, size, kind) && !IsCloudOnly(info.Attributes);
+        bool wants = WantsContent(path, ext, size, kind) && !IsCloudOnly(info.Attributes);
 
         using (var sel = Cmd("SELECT id, mtime, size FROM files WHERE path = $p;"))
         {
@@ -239,12 +241,98 @@ public sealed class IndexStore : IDisposable
         return (a & (FileAttributes.Offline | RecallOnOpen | RecallOnDataAccess)) != 0;
     }
 
-    private bool WantsContent(string ext, long size, FileKind kind)
+    private bool WantsContent(string path, string ext, long size, FileKind kind)
     {
-        if (!_settings.IndexContents || kind == FileKind.Folder || ext.Length == 0) return false;
-        if (!ContentExtractors.Default.CanExtract(ext)) return false;
+        if (kind == FileKind.Folder || ext.Length == 0) return false;
+        if (!ContentExtractors.Default.CanExtract(ext) || !_settings.WantsContentFor(ext, path)) return false;
         long limit = (ext == ".pdf" ? _settings.MaxPdfFileSizeMB : _settings.MaxContentFileSizeMB) * 1024L * 1024L;
         return size > 0 && size <= limit;
+    }
+
+    // ---------------------------------------------------------------- space
+
+    /// <summary>Drops the text of files whose text is no longer wanted (a file type or folder switched
+    /// to name-only in Settings, or an index built by an older version that read everything). Their
+    /// names stay searchable. Returns how many files lost their text.</summary>
+    public int PurgeIneligibleContent()
+    {
+        var doomed = new List<long>();
+        lock (_lock)
+        {
+            using (var c = Cmd("SELECT id, path, ext, size, kind FROM files WHERE wants_content = 1 OR has_content = 1 OR content_mtime <> 0;"))
+            using (var r = c.ExecuteReader())
+                while (r.Read())
+                    if (!WantsContent(r.GetString(1), r.GetString(2), r.GetInt64(3), (FileKind)r.GetInt32(4)))
+                        doomed.Add(r.GetInt64(0));
+            if (doomed.Count == 0) return 0;
+            using var tx = _conn.BeginTransaction();
+            foreach (var chunk in doomed.Chunk(500))
+            {
+                var ids = string.Join(',', chunk);
+                using var d = _conn.CreateCommand();
+                d.Transaction = tx;
+                d.CommandText = $"""
+                    DELETE FROM content_fts WHERE rowid IN ({ids});
+                    DELETE FROM texts WHERE id IN ({ids});
+                    UPDATE files SET wants_content = 0, has_content = 0, content_chars = 0, content_note = NULL, content_mtime = 0 WHERE id IN ({ids});
+                    """;
+                d.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+        return doomed.Count;
+    }
+
+    /// <summary>Merges the full-text indexes into one segment each. Deleted documents only leave
+    /// tombstones in FTS5 until segments are merged, so after dropping a lot of text this is what
+    /// actually frees the space. Rewrites the whole index: run it rarely.</summary>
+    public void Optimize()
+    {
+        lock (_lock)
+        {
+            Exec(_conn, "INSERT INTO content_fts(content_fts) VALUES('optimize'); INSERT INTO names_fts(names_fts) VALUES('optimize');");
+        }
+    }
+
+    /// <summary>Gives free pages back to the file system (the index is created with incremental
+    /// auto-vacuum; older indexes get it when they are moved with <see cref="Relocate"/>).</summary>
+    public void ReleaseSpace()
+    {
+        lock (_lock)
+        {
+            Exec(_conn, "PRAGMA incremental_vacuum; PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+    }
+
+    /// <summary>
+    /// Moves the index to <paramref name="toDb"/>: drops text that is no longer wanted, then writes a
+    /// compacted copy (VACUUM INTO, so freed space is really gone) and deletes the old files. Nothing
+    /// may have the old index open. If the copy fails the old index is left as it was.
+    /// </summary>
+    public static void Relocate(string fromDb, string toDb, Settings settings, Action<string>? progress = null)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(toDb))!);
+        var tmp = toDb + ".moving";
+        File.Delete(tmp);
+        using (var store = new IndexStore(fromDb, settings))
+        {
+            progress?.Invoke("正在清理不需要的正文…");
+            store.PurgeIneligibleContent();
+            progress?.Invoke("正在合并全文索引…");
+            store.Optimize();
+            progress?.Invoke("正在写入新位置并压缩…");
+            lock (store._lock)
+            {
+                using var c = store._conn.CreateCommand();
+                c.CommandText = "PRAGMA auto_vacuum = INCREMENTAL; VACUUM INTO $p;";
+                c.Parameters.AddWithValue("$p", tmp);
+                c.ExecuteNonQuery();
+            }
+        }
+        SqliteConnection.ClearAllPools();
+        File.Move(tmp, toDb, overwrite: true);
+        foreach (var f in new[] { fromDb, fromDb + "-wal", fromDb + "-shm" })
+            try { File.Delete(f); } catch (IOException) { }
     }
 
     // ---------------------------------------------------------------- deletes

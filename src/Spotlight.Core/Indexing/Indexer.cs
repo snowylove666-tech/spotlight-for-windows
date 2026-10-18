@@ -113,6 +113,7 @@ public sealed class Indexer : IDisposable
         var ct = _cts.Token;
         try
         {
+            DropUnwantedText();
             FullScan(ct);
             StartWatchers();
             while (!ct.IsCancellationRequested)
@@ -136,9 +137,19 @@ public sealed class Indexer : IDisposable
     /// <summary>Runs one full crawl and the content pass synchronously. Used by the CLI and tests.</summary>
     public void RunOnce(CancellationToken ct = default)
     {
+        DropUnwantedText();
         FullScan(ct);
         while (ReadContents(ct, ignoreBattery: true) && _store.PendingContentCount() > 0) { }
         Publish(IndexPhase.Idle);
+    }
+
+    /// <summary>File types or folders switched to name-only: drop their text and give the space back.</summary>
+    private void DropUnwantedText()
+    {
+        int dropped = _store.PurgeIneligibleContent();
+        if (dropped == 0) return;
+        if (dropped > 500) _store.Optimize();
+        _store.ReleaseSpace();
     }
 
     private void FullScan(CancellationToken ct)
@@ -446,6 +457,8 @@ public sealed class Indexer : IDisposable
         {
             if (!_settings.IndexContents) lines.Add("正文索引已在设置中关闭。");
             else if (!ContentExtractors.Default.CanExtract(ext)) lines.Add($"不支持读取 {ext} 文件的正文。");
+            else if (_settings.IsExcludedContentPath(path)) lines.Add("它所在的文件夹设置为只收录文件名、不读正文（设置 →「只收录文件名的文件夹」）。");
+            else if (!_settings.WantsContentFor(ext, path)) lines.Add($"{ext} 这类文件设置为只收录文件名（可在设置 →「读取正文的文件类型」中打开）。");
             else
             {
                 long limitMb = ext == ".pdf" ? _settings.MaxPdfFileSizeMB : _settings.MaxContentFileSizeMB;

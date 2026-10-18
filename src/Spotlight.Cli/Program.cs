@@ -8,7 +8,7 @@ using Spotlight.Core.Search;
 //   spotlight-cli search <query> [--db file]      print ranked results
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 var argList = args.ToList();
-string db = Path.Combine(Settings.AppDataDir, "index.db");
+string? db = null;
 int dbAt = argList.IndexOf("--db");
 if (dbAt >= 0 && dbAt + 1 < argList.Count) { db = argList[dbAt + 1]; argList.RemoveRange(dbAt, 2); }
 
@@ -18,7 +18,8 @@ if (argList.Count < 2 || argList[0] is not ("index" or "search" or "check"))
     return 1;
 }
 
-var settings = Settings.Load(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(db))!, "settings.json"));
+var settings = db == null ? Settings.Load() : Settings.Load(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(db))!, "settings.json"));
+db ??= settings.IndexDbPath;
 if (argList[0] == "index")
 {
     var roots = argList.Skip(1).Select(Path.GetFullPath).ToList();

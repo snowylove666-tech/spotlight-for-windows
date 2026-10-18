@@ -36,6 +36,10 @@
 
     <ScrollViewer Padding="24,4,24,20">
       <StackPanel>
+        <TextBlock Classes="h" Text="启动" />
+        <CheckBox x:Name="AutostartCheck" Content="开机自动启动（在后台运行，不弹出窗口）" />
+        <TextBlock Classes="hint" Text="也可以在托盘图标的右键菜单里随时打开或关闭。" Margin="0,2,0,0" />
+
         <TextBlock Classes="h" Text="快捷键" />
         <TextBox x:Name="HotkeyBox" Width="220" HorizontalAlignment="Left" Watermark="例如 Alt+Space" />
         <TextBlock Classes="hint" Text="可用 Ctrl、Alt、Shift、Win 加一个键，例如 Alt+Space、Ctrl+Shift+F、Win+F2。" Margin="0,4,0,0" />
@@ -64,7 +68,15 @@
         <TextBox x:Name="ExtensionsBox" Watermark="例如 .log, .tmp" />
 
         <TextBlock Classes="h" Text="文档正文" />
-        <CheckBox x:Name="ContentsCheck" Content="读取文档里的文字（PDF、Word、Excel、PPT、文本等）" />
+        <CheckBox x:Name="ContentsCheck" Content="读取文档里的文字，可以按内容搜索" />
+        <TextBlock Classes="hint" Text="读取正文的文件类型（没勾选的类型仍能按文件名搜到，只是不占用空间保存文字）：" Margin="0,8,0,4" />
+        <WrapPanel x:Name="ContentKindsPanel" />
+        <TextBlock Classes="hint" Text="只收录文件名、不读正文的文件夹（例如软件安装目录）：" Margin="0,10,0,4" />
+        <ListBox x:Name="NoContentList" Classes="paths" Height="70" />
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+          <Button x:Name="AddNoContent" Content="添加文件夹…" />
+          <Button x:Name="RemoveNoContent" Content="移除所选" />
+        </StackPanel>
         <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
           <TextBlock Text="PDF 大小上限" VerticalAlignment="Center" />
           <NumericUpDown x:Name="PdfLimit" Minimum="1" Maximum="2000" Increment="10" FormatString="0" Width="130" />
@@ -78,9 +90,15 @@
         <CheckBox x:Name="BatteryCheck" Content="使用电池时暂停读取正文（更省电）" Margin="0,6,0,0" />
         <CheckBox x:Name="FastCheck" Content="插上电源且待读文档较多时，用多核加速（首次建索引快很多）" />
 
+        <TextBlock Classes="h" Text="索引位置" />
+        <TextBlock Classes="hint" Text="索引文件保存的文件夹。放在非系统盘可以不占 C 盘空间；更改后会自动搬过去。" />
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <TextBlock x:Name="IndexFolderText" VerticalAlignment="Center" />
+          <Button x:Name="ChangeIndexFolder" Content="更改…" />
+        </StackPanel>
+
         <TextBlock Classes="h" Text="其他" />
         <CheckBox x:Name="HiddenCheck" Content="索引隐藏文件" />
-        <CheckBox x:Name="AutostartCheck" Content="开机自动启动" />
       </StackPanel>
     </ScrollViewer>
   </DockPanel>

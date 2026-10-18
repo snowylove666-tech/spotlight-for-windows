@@ -26,9 +26,19 @@ public partial class App : Application
     public override void OnFrameworkInitializationCompleted()
     {
         if (ApplicationLifetime is not IClassicDesktopStyleApplicationLifetime desktop) return;
-
         _settings = Settings.Load();
-        var dbPath = Path.Combine(Settings.AppDataDir, "index.db");
+        _ = StartAsync(desktop);
+        base.OnFrameworkInitializationCompleted();
+    }
+
+    private async Task StartAsync(IClassicDesktopStyleApplicationLifetime desktop)
+    {
+        var dbPath = _settings.IndexDbPath;
+        // Versions before 0.5.0 kept the index in %AppData% on the system drive: move it once.
+        var legacy = Path.Combine(Settings.AppDataDir, "index.db");
+        if (!SamePath(legacy, dbPath) && File.Exists(legacy) && !File.Exists(dbPath))
+            await RelocateWithProgress(legacy, dbPath);
+
         _store = new IndexStore(dbPath, _settings);
         _engine = new SearchEngine(dbPath);
 
@@ -39,6 +49,7 @@ public partial class App : Application
         RegisterHotkey();
 
         SingleInstance.ListenForShow(() => Dispatcher.UIThread.Post(_window.ShowSearch));
+        try { Platform.RefreshStartupEntry(); } catch (Exception) { }
         CreateTrayIcon();
 
         desktop.ShutdownRequested += (_, _) => Cleanup();
@@ -46,8 +57,60 @@ public partial class App : Application
         bool background = desktop.Args?.Contains("--background") == true;
         if (!background) _window.ShowSearch();
         else ScheduleTrim();
+    }
 
-        base.OnFrameworkInitializationCompleted();
+    private static bool SamePath(string a, string b) =>
+        string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Moves (and compacts) the index while a small window explains the wait.</summary>
+    private async Task RelocateWithProgress(string from, string to)
+    {
+        var text = new TextBlock { Text = "正在把索引移到 " + Path.GetDirectoryName(to) + "，并清理不需要的正文…", TextWrapping = Avalonia.Media.TextWrapping.Wrap };
+        var note = new TextBlock { Text = "只需一次，通常一两分钟。完成后会自动继续。", Opacity = 0.65, FontSize = 12, Margin = new Thickness(0, 8, 0, 0) };
+        var w = new Window
+        {
+            Title = "聚焦搜索",
+            Width = 460,
+            SizeToContent = SizeToContent.Height,
+            CanResize = false,
+            WindowStartupLocation = WindowStartupLocation.CenterScreen,
+            Content = new StackPanel { Margin = new Thickness(24, 20), Children = { text, new ProgressBar { IsIndeterminate = true, Margin = new Thickness(0, 12, 0, 0) }, note } },
+        };
+        w.Show();
+        try
+        {
+            await Task.Run(() => IndexStore.Relocate(from, to, _settings, msg => Dispatcher.UIThread.Post(() => note.Text = msg)));
+        }
+        catch (Exception e)
+        {
+            // Keep working from the old place rather than not starting at all.
+            text.Text = "移动索引失败：" + e.Message;
+            await Task.Delay(4000);
+        }
+        finally { w.Close(); }
+    }
+
+    /// <summary>Settings → 索引位置 → 更改: stop everything, move the index, start again.</summary>
+    private async Task MoveIndexTo(string folder)
+    {
+        var from = _settings.IndexDbPath;
+        var to = Path.Combine(folder, "index.db");
+        if (SamePath(from, to)) return;
+        _window.HideSearch();
+        _indexer.Dispose();
+        _engine.Dispose();
+        _store.Dispose();
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        await RelocateWithProgress(from, to);
+        if (File.Exists(to))
+        {
+            _settings.IndexFolder = folder;
+            _settings.Save();
+        }
+        _store = new IndexStore(_settings.IndexDbPath, _settings);
+        _engine = new SearchEngine(_settings.IndexDbPath);
+        _window.Rebind(_engine, _store);
+        StartIndexer();
     }
 
     private void StartIndexer()
@@ -101,6 +164,12 @@ public partial class App : Application
     // ---------------------------------------------------------------- tray
 
     private NativeMenuItem? _showItem;
+    private NativeMenuItem? _autostartItem;
+
+    private static bool SafeStartsWithWindows()
+    {
+        try { return Platform.StartsWithWindows; } catch (Exception) { return false; }
+    }
     private SettingsWindow? _settingsWindow;
 
     private void CreateTrayIcon()
@@ -113,6 +182,12 @@ public partial class App : Application
         settings.Click += (_, _) => OpenSettings();
         var rescan = new NativeMenuItem("重新扫描所有文件");
         rescan.Click += (_, _) => _indexer.RequestFullRescan();
+        _autostartItem = new NativeMenuItem("开机自动启动") { ToggleType = NativeMenuItemToggleType.CheckBox, IsChecked = SafeStartsWithWindows() };
+        _autostartItem.Click += (_, _) =>
+        {
+            try { Platform.StartsWithWindows = !SafeStartsWithWindows(); } catch (Exception) { }
+            _autostartItem.IsChecked = SafeStartsWithWindows();
+        };
         var check = new NativeMenuItem("检查某个文件为什么搜不到…");
         check.Click += async (_, _) => await CheckFileAsync();
         var quit = new NativeMenuItem("退出");
@@ -122,7 +197,7 @@ public partial class App : Application
         {
             Icon = new WindowIcon(iconStream),
             ToolTipText = "聚焦搜索",
-            Menu = new NativeMenu { _showItem, new NativeMenuItemSeparator(), settings, rescan, check, new NativeMenuItemSeparator(), quit },
+            Menu = new NativeMenu { _showItem, new NativeMenuItemSeparator(), settings, _autostartItem, rescan, check, new NativeMenuItemSeparator(), quit },
         };
         _tray.Clicked += (_, _) => _window.ShowSearch();
         TrayIcon.SetIcons(this, new TrayIcons { _tray });
@@ -132,8 +207,10 @@ public partial class App : Application
     {
         if (_settingsWindow != null) { _settingsWindow.Activate(); return; }
         _settingsWindow = new SettingsWindow(_settings);
+        _settingsWindow.IndexFolderChosen += folder => _ = MoveIndexTo(folder);
         _settingsWindow.Saved += () =>
         {
+            if (_autostartItem != null) _autostartItem.IsChecked = SafeStartsWithWindows();
             RegisterHotkey();
             // New locations or filters: restart the indexer. Its first full crawl adds what is now in
             // scope and removes what is not.

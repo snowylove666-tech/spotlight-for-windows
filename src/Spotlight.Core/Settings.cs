@@ -5,7 +5,7 @@ namespace Spotlight.Core;
 
 public sealed class Settings
 {
-    public const int CurrentVersion = 3;
+    public const int CurrentVersion = 4;
 
     /// <summary>Format version of this file; older files are upgraded on load.</summary>
     public int SettingsVersion { get; set; } = 1; // files from 0.1.0 have no version field
@@ -36,6 +36,66 @@ public sealed class Settings
 
     /// <summary>Whether to read and index the text inside documents.</summary>
     public bool IndexContents { get; set; } = true;
+
+    /// <summary>Kinds of files whose text is read, by <see cref="ContentCategory"/> name. The others
+    /// are found by name only: spreadsheets, logs, code and config files are mostly data, and their
+    /// text made up over half of a typical index without being what people search for.</summary>
+    public List<string> ContentCategories { get; set; } = DefaultContentCategories();
+
+    public static List<string> DefaultContentCategories() =>
+        new() { nameof(ContentCategory.Pdf), nameof(ContentCategory.Word), nameof(ContentCategory.Presentation), nameof(ContentCategory.Text) };
+
+    /// <summary>Folders whose files are found by name only (their text is not read), e.g. program folders.</summary>
+    public List<string> ExcludedContentPaths { get; set; } = new();
+
+    /// <summary>Folder holding index.db. Null until first start, which picks <see cref="DefaultIndexFolder"/>.</summary>
+    public string? IndexFolder { get; set; }
+
+    [JsonIgnore] public string IndexDbPath => Path.Combine(IndexFolder ?? AppDataDir, "index.db");
+
+    /// <summary>Whether the text of this file should be read, given its extension and location.</summary>
+    public bool WantsContentFor(string ext, string path)
+    {
+        if (!IndexContents) return false;
+        var cat = CategoryOf(ext);
+        if (cat == ContentCategory.None || !ContentCategories.Contains(cat.ToString(), StringComparer.OrdinalIgnoreCase)) return false;
+        return !IsExcludedContentPath(path);
+    }
+
+    public bool IsExcludedContentPath(string path) =>
+        ExcludedContentPaths.Any(p => path.StartsWith(WithSeparator(Path.TrimEndingDirectorySeparator(p)), StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Which group of readable files an extension belongs to (None: no text is ever read).</summary>
+    public static ContentCategory CategoryOf(string ext) => ext.ToLowerInvariant() switch
+    {
+        ".pdf" => ContentCategory.Pdf,
+        ".docx" or ".docm" or ".odt" => ContentCategory.Word,
+        ".pptx" or ".odp" => ContentCategory.Presentation,
+        ".txt" or ".md" or ".markdown" or ".rst" or ".tex" or ".srt" or ".ass" or ".vtt" => ContentCategory.Text,
+        ".xlsx" or ".xlsm" or ".ods" or ".csv" or ".tsv" => ContentCategory.Spreadsheet,
+        ".html" or ".htm" => ContentCategory.Web,
+        ".log" or ".ini" or ".cfg" or ".conf" or ".properties" => ContentCategory.Log,
+        var e when Extraction.ContentExtractors.Default.CanExtract(e) => ContentCategory.Code,
+        _ => ContentCategory.None,
+    };
+
+    /// <summary>A data drive (not the system drive) with the most free space, else %AppData%.</summary>
+    public static string DefaultIndexFolder()
+    {
+        if (!OperatingSystem.IsWindows()) return AppDataDir;
+        string? best = null;
+        long free = 0;
+        foreach (var root in DataDrives())
+        {
+            try
+            {
+                var d = new DriveInfo(root);
+                if (d.AvailableFreeSpace > free && d.AvailableFreeSpace > 10L * 1024 * 1024 * 1024) { free = d.AvailableFreeSpace; best = root; }
+            }
+            catch (IOException) { }
+        }
+        return best == null ? AppDataDir : Path.Combine(best, "SpotlightWinData");
+    }
 
     /// <summary>Largest file whose contents are indexed, in MB. PDFs get their own limit.</summary>
     public int MaxContentFileSizeMB { get; set; } = 20;
@@ -106,6 +166,12 @@ public sealed class Settings
         }
         s.FilePath = path;
         bool upgraded = s.Upgrade();
+        if (s.IndexFolder == null)
+        {
+            // Chosen once and remembered, so plugging in a bigger drive later doesn't move the index.
+            s.IndexFolder = DefaultIndexFolder();
+            upgraded = true;
+        }
         if (upgraded || !File.Exists(path)) s.Save();
         return s;
     }
@@ -127,6 +193,13 @@ public sealed class Settings
         {
             // 30 results hid long courseware that mentions a term only a few times.
             if (MaxResults == 30) MaxResults = 60;
+        }
+        if (SettingsVersion < 4)
+        {
+            // 0.5.0: text only for documents (ContentCategories default), index off the system drive,
+            // and the user's program folder read by name only.
+            if (OperatingSystem.IsWindows() && Directory.Exists(@"D:\0.SOFT") && !ExcludedContentPaths.Contains(@"D:\0.SOFT", StringComparer.OrdinalIgnoreCase))
+                ExcludedContentPaths.Add(@"D:\0.SOFT");
         }
         SettingsVersion = CurrentVersion;
         return true;

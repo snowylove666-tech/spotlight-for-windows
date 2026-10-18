@@ -33,7 +33,7 @@
 | `Ctrl+Shift+C` | 复制路径 |
 | `Esc` | 清空输入，再按一次关闭 |
 
-默认搜索位置：桌面、文档、下载、图片、音乐、视频、OneDrive，以及除系统盘外的所有本地磁盘（包括百度网盘同步盘、OneDrive 这类云同步文件夹；“仅在线”的云文件只收录文件名）。设置保存在 `%AppData%\SpotlightWin\settings.json`，索引文件是同目录下的 `index.db`，删掉后会自动重建。
+默认搜索位置：桌面、文档、下载、图片、音乐、视频、OneDrive，以及除系统盘外的所有本地磁盘（包括百度网盘同步盘、OneDrive 这类云同步文件夹；“仅在线”的云文件只收录文件名）。设置保存在 `%AppData%\SpotlightWin\settings.json`。索引文件 `index.db` 默认放在剩余空间最大的非系统盘（例如 `D:\SpotlightWinData`），可在设置「索引位置」中更改；删掉后会自动重建。默认只读取 PDF、Word、PPT 和文本/Markdown 的正文，表格、日志、代码等只收录文件名（设置「读取正文的文件类型」可改）。
 
 ## 从源码构建
 

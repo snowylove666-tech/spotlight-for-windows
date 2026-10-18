@@ -96,6 +96,18 @@ internal static partial class Platform
         else Process.Start("xdg-open", Path.GetDirectoryName(path) ?? path);
     }
 
+    /// <summary>If start-up is on but points at another copy of the exe (an older version in another
+    /// folder), point it at this one, so updating the app never leaves Windows starting the old one.</summary>
+    public static void RefreshStartupEntry()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
+        if (key?.GetValue(RunValue) is string current && current != StartupCommand)
+            key.SetValue(RunValue, StartupCommand);
+    }
+
+    private static string StartupCommand => $"\"{Environment.ProcessPath}\" --background";
+
     public static bool StartsWithWindows
     {
         get
@@ -108,7 +120,7 @@ internal static partial class Platform
         {
             if (!OperatingSystem.IsWindows()) return;
             using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey);
-            if (value) key.SetValue(RunValue, $"\"{Environment.ProcessPath}\" --background");
+            if (value) key.SetValue(RunValue, StartupCommand);
             else key.DeleteValue(RunValue, throwOnMissingValue: false);
         }
     }

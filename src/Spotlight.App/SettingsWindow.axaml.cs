@@ -23,7 +23,25 @@ public partial class SettingsWindow : Window
         (FileKind.Other, "其他文件"),
     };
 
+    private static readonly (ContentCategory cat, string label)[] ContentKinds =
+    {
+        (ContentCategory.Pdf, "PDF"),
+        (ContentCategory.Word, "Word 文稿"),
+        (ContentCategory.Presentation, "PPT 演示文稿"),
+        (ContentCategory.Text, "文本、Markdown"),
+        (ContentCategory.Spreadsheet, "表格（xlsx、csv）"),
+        (ContentCategory.Web, "网页"),
+        (ContentCategory.Code, "代码与数据（py、json、xml…）"),
+        (ContentCategory.Log, "日志与配置（log、ini…）"),
+    };
+
     private readonly Settings _settings;
+    private readonly ObservableCollection<string> _noContent = new();
+    private readonly List<(ContentCategory cat, CheckBox box)> _contentBoxes = new();
+    private string? _newIndexFolder;
+
+    /// <summary>Raised after saving when the user picked another folder for the index.</summary>
+    public event Action<string>? IndexFolderChosen;
     private readonly ObservableCollection<string> _roots = new();
     private readonly ObservableCollection<string> _excluded = new();
     private readonly List<(FileKind kind, CheckBox box)> _kindBoxes = new();
@@ -56,6 +74,20 @@ public partial class SettingsWindow : Window
             KindsPanel.Children.Add(box);
         }
         ExtensionsBox.Text = string.Join(", ", settings.ExcludedExtensions);
+        foreach (var (cat, label) in ContentKinds)
+        {
+            var box = new CheckBox
+            {
+                Content = label,
+                IsChecked = settings.ContentCategories.Contains(cat.ToString(), StringComparer.OrdinalIgnoreCase),
+                Margin = new Avalonia.Thickness(0, 0, 18, 4),
+            };
+            _contentBoxes.Add((cat, box));
+            ContentKindsPanel.Children.Add(box);
+        }
+        NoContentList.ItemsSource = _noContent;
+        foreach (var p in settings.ExcludedContentPaths) _noContent.Add(p);
+        IndexFolderText.Text = settings.IndexFolder ?? Settings.AppDataDir;
         ContentsCheck.IsChecked = settings.IndexContents;
         PdfLimit.Value = settings.MaxPdfFileSizeMB;
         DocLimit.Value = settings.MaxContentFileSizeMB;
@@ -69,6 +101,12 @@ public partial class SettingsWindow : Window
         DefaultRoots.Click += (_, _) => SetRoots(new Settings().EffectiveRoots(), true);
         AddExcluded.Click += async (_, _) => { if (await PickFolder("选择不需要搜索的文件夹") is { } p) AddUnique(_excluded, p); };
         RemoveExcluded.Click += (_, _) => { if (ExcludedList.SelectedItem is string s) _excluded.Remove(s); };
+        AddNoContent.Click += async (_, _) => { if (await PickFolder("选择只收录文件名的文件夹") is { } p) AddUnique(_noContent, p); };
+        RemoveNoContent.Click += (_, _) => { if (NoContentList.SelectedItem is string s) _noContent.Remove(s); };
+        ChangeIndexFolder.Click += async (_, _) =>
+        {
+            if (await PickFolder("选择保存索引的文件夹") is { } p) { _newIndexFolder = p; IndexFolderText.Text = p + "（保存后搬过去）"; }
+        };
         CancelButton.Click += (_, _) => Close();
         SaveButton.Click += (_, _) => Save();
     }
@@ -128,6 +166,8 @@ public partial class SettingsWindow : Window
         _settings.PauseContentIndexingOnBattery = BatteryCheck.IsChecked == true;
         _settings.FastIndexingWhenPluggedIn = FastCheck.IsChecked == true;
         _settings.IndexHiddenFiles = HiddenCheck.IsChecked == true;
+        _settings.ContentCategories = _contentBoxes.Where(b => b.box.IsChecked == true).Select(b => b.cat.ToString()).ToList();
+        _settings.ExcludedContentPaths = _noContent.ToList();
         try { Platform.StartsWithWindows = AutostartCheck.IsChecked == true; } catch (Exception) { }
 
         try { _settings.Save(); }
@@ -137,6 +177,7 @@ public partial class SettingsWindow : Window
             return;
         }
         Saved?.Invoke();
+        if (_newIndexFolder != null) IndexFolderChosen?.Invoke(_newIndexFolder);
         Close();
     }
 }

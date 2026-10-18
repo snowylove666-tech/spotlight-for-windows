@@ -18,6 +18,9 @@ public enum FileKind
     Calculator = 100,
 }
 
+/// <summary>Groups of files whose text can be read; the user picks which ones in Settings.</summary>
+public enum ContentCategory { None, Pdf, Word, Presentation, Text, Spreadsheet, Web, Code, Log }
+
 public static class FileKinds
 {
     private static readonly Dictionary<string, FileKind> ByExt = new(StringComparer.OrdinalIgnoreCase);

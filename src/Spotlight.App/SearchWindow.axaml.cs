@@ -14,8 +14,8 @@ namespace Spotlight.App;
 
 public partial class SearchWindow : Window
 {
-    private readonly SearchEngine _engine;
-    private readonly IndexStore _store;
+    private SearchEngine _engine;
+    private IndexStore _store;
     private readonly Settings _settings;
     private readonly ObservableCollection<ResultItem> _items = new();
     private CancellationTokenSource? _searchCts;
@@ -51,6 +51,15 @@ public partial class SearchWindow : Window
                 Shell.BorderThickness = new Thickness(0);
             }
         };
+    }
+
+    /// <summary>Points the window at a reopened index (after it was moved to another folder).</summary>
+    public void Rebind(SearchEngine engine, IndexStore store)
+    {
+        _engine = engine;
+        _store = store;
+        _items.Clear();
+        ResultsArea.IsVisible = false;
     }
 
     // ---------------------------------------------------------------- show / hide
