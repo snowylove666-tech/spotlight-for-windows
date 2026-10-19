@@ -115,6 +115,17 @@ public sealed class SpaceTests : IDisposable
     }
 
     [Fact]
+    public void IndexFolderIsCreatedOnFirstStart()
+    {
+        // A new PC: the chosen folder (e.g. D:\SpotlightWinData) doesn't exist yet.
+        var db = Path.Combine(_dir, "new", "nested", "index.db");
+        using (var store = new IndexStore(db, new Settings())) { }
+        Assert.True(File.Exists(db));
+        using var e = new SearchEngine(db);
+        Assert.Empty(e.Search("anything"));
+    }
+
+    [Fact]
     public void UpgradeTo050PicksAnIndexFolderAndKeepsChoices()
     {
         var path = Path.Combine(_dir, "settings.json");

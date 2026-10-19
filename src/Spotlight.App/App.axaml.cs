@@ -26,9 +26,48 @@ public partial class App : Application
     public override void OnFrameworkInitializationCompleted()
     {
         if (ApplicationLifetime is not IClassicDesktopStyleApplicationLifetime desktop) return;
-        _settings = Settings.Load();
-        _ = StartAsync(desktop);
+        _ = StartSafelyAsync(desktop);
         base.OnFrameworkInitializationCompleted();
+    }
+
+    /// <summary>A failure while starting must never leave an invisible process behind (no window, no
+    /// tray icon, and every later launch just signalling it): say what went wrong, log it, and exit.</summary>
+    private async Task StartSafelyAsync(IClassicDesktopStyleApplicationLifetime desktop)
+    {
+        try
+        {
+            _settings = Settings.Load();
+            await StartAsync(desktop);
+        }
+        catch (Exception e)
+        {
+            var log = Path.Combine(Path.GetTempPath(), "SpotlightWin-error.log");
+            try
+            {
+                log = Path.Combine(Settings.AppDataDir, "error.log");
+                File.AppendAllText(log, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {e}\n\n");
+            }
+            catch (Exception) { }
+            var w = new Window
+            {
+                Title = "聚焦搜索无法启动",
+                Width = 520,
+                SizeToContent = SizeToContent.Height,
+                CanResize = false,
+                WindowStartupLocation = WindowStartupLocation.CenterScreen,
+                Content = new StackPanel
+                {
+                    Margin = new Thickness(24, 20),
+                    Children =
+                    {
+                        new TextBlock { Text = "启动时出错：" + e.Message, TextWrapping = Avalonia.Media.TextWrapping.Wrap },
+                        new TextBlock { Text = "详细信息已保存到 " + log + "，可以发给开发者排查。", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Opacity = 0.65, FontSize = 12, Margin = new Thickness(0, 10, 0, 0) },
+                    },
+                },
+            };
+            w.Closed += (_, _) => desktop.Shutdown(1);
+            w.Show();
+        }
     }
 
     private async Task StartAsync(IClassicDesktopStyleApplicationLifetime desktop)
@@ -39,7 +78,14 @@ public partial class App : Application
         if (!SamePath(legacy, dbPath) && File.Exists(legacy) && !File.Exists(dbPath))
             await RelocateWithProgress(legacy, dbPath);
 
-        _store = new IndexStore(dbPath, _settings);
+        try { _store = new IndexStore(dbPath, _settings); }
+        catch (Exception) when (!SamePath(dbPath, legacy))
+        {
+            // The index drive is missing or read-only (e.g. an unplugged disk): run from %AppData% this
+            // time without changing the setting, so the index is back once the drive is.
+            dbPath = legacy;
+            _store = new IndexStore(dbPath, _settings);
+        }
         _engine = new SearchEngine(dbPath);
 
         _window = new SearchWindow(_engine, _store, _settings);

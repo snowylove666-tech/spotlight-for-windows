@@ -2,7 +2,7 @@
 
 在 Windows 上使用的「聚焦搜索」：按 `Alt+Space` 唤起，输入关键词，立刻找到应用、文件、文件夹，以及 PDF、Word、PowerPoint、文本文件里的文字；右侧直接预览命中的那一页，回车打开并跳到该页。
 
-**[⬇ 下载最新版 SpotlightWin.exe](https://github.com/snowylove666-tech/spotlight-for-windows/releases/latest)**：单个 exe，免安装，无需 .NET，Windows 10/11 x64。
+**[⬇ 下载最新版](https://github.com/snowylove666-tech/spotlight-for-windows/releases/latest)**：推荐 `SpotlightWin-Setup-x.y.z.exe` 安装包（不需要管理员权限，带开始菜单、开机启动和卸载）；也可以下载单独的 `SpotlightWin.exe` 免安装直接运行。无需 .NET，Windows 10/11 x64。
 
 > **English:** A macOS Spotlight–style launcher and desktop search for Windows. Press `Alt+Space` to instantly find apps, files and the text inside PDF / Word / PowerPoint documents (Chinese supported), preview the matching page with highlights, and open it right at that page. Fully local and private; a single portable exe built with C# / .NET 10, Avalonia and SQLite FTS5.
 
@@ -50,6 +50,9 @@ dotnet test
 
 # 直接运行（调试）
 dotnet run --project src/Spotlight.App
+
+# 打包安装包（需要 Inno Setup 6，输出到 artifacts\installer\）
+powershell -ExecutionPolicy Bypass -File installer\build.ps1
 
 # 打包成单个 exe（输出到 artifacts\win-x64\SpotlightWin.exe）
 dotnet publish src/Spotlight.App -c Release -r win-x64 -o artifacts/win-x64

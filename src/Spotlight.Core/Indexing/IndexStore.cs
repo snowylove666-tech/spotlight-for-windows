@@ -34,6 +34,8 @@ public sealed class IndexStore : IDisposable
         DbPath = dbPath;
         _settings = settings;
         _appRoots = new HashSet<string>(Settings.AppRoots(), StringComparer.OrdinalIgnoreCase);
+        // First start on a new PC: the index folder (e.g. D:\SpotlightWinData) doesn't exist yet.
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dbPath))!);
         _conn = Open(dbPath, readOnly: false);
         EnsureSchema();
     }

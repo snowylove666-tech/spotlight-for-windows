@@ -114,8 +114,10 @@ public sealed class Indexer : IDisposable
         try
         {
             DropUnwantedText();
-            FullScan(ct);
+            // Watch first: files created or deleted while the (possibly long) first crawl runs are
+            // queued and applied right after it, instead of waiting for the next full scan.
             StartWatchers();
+            FullScan(ct);
             while (!ct.IsCancellationRequested)
             {
                 if (_fullRescanRequested) { _fullRescanRequested = false; FullScan(ct); }
