@@ -33,6 +33,29 @@
     <Style Selector="ListBoxItem:selected:pointerover /template/ ContentPresenter#PART_ContentPresenter">
       <Setter Property="Background" Value="{DynamicResource SelectionBrush}" />
     </Style>
+    <!-- Filter / sort chips under the search box. Not focusable, so typing stays in the box. -->
+    <Style Selector="Button.chip">
+      <Setter Property="Focusable" Value="False" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Padding" Value="9,3" />
+      <Setter Property="MinHeight" Value="0" />
+      <Setter Property="CornerRadius" Value="11" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="Foreground" Value="{DynamicResource TextSecondary}" />
+    </Style>
+    <Style Selector="Button.chip:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource DividerBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimary}" />
+    </Style>
+    <Style Selector="Button.chip.on">
+      <Setter Property="Background" Value="{DynamicResource SelectionBrush}" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style Selector="Button.chip.on:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource SelectionBrush}" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
     <Style Selector="TextBox#Query">
       <Setter Property="Background" Value="Transparent" />
       <Setter Property="BorderThickness" Value="0" />
@@ -62,6 +85,13 @@
         <TextBox x:Name="Query" Grid.Column="1" Margin="10,0,0,0" FontSize="24"
                  Foreground="{DynamicResource TextPrimary}"
                  Watermark="聚焦搜索" VerticalContentAlignment="Center" />
+      </Grid>
+
+      <Grid x:Name="FilterBar" IsVisible="False" ColumnDefinitions="*,Auto" Margin="14,0,14,8">
+        <StackPanel x:Name="KindChips" Orientation="Horizontal" Spacing="2" />
+        <StackPanel x:Name="SortChips" Grid.Column="1" Orientation="Horizontal" Spacing="2">
+          <TextBlock Text="排序" FontSize="12" VerticalAlignment="Center" Margin="0,0,4,0" Foreground="{DynamicResource TextSecondary}" />
+        </StackPanel>
       </Grid>
 
       <TextBlock x:Name="Notice" IsVisible="False" TextWrapping="Wrap" Margin="20,0,20,10"
@@ -128,7 +158,7 @@
         <Grid ColumnDefinitions="*,Auto">
           <TextBlock x:Name="Status" FontSize="11" Foreground="{DynamicResource TextSecondary}" TextTrimming="CharacterEllipsis" />
           <TextBlock Grid.Column="1" FontSize="11" Foreground="{DynamicResource TextSecondary}"
-                     Text="↵ 打开   Ctrl+↵ 打开位置   Ctrl+Shift+C 复制路径   Esc 关闭" />
+                     Text="↵ 打开   Ctrl+↵ 打开位置   Tab 切换类型   Ctrl+Shift+C 复制路径   Esc 关闭" />
         </Grid>
       </Border>
     </StackPanel>

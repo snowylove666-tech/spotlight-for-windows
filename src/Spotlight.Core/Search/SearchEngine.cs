@@ -32,6 +32,17 @@ public sealed class SearchResult
     public override string ToString() => $"{Score,7:F1}  {FileKinds.DisplayName(Kind),-4} {Name}  ({Path})";
 }
 
+public enum SortBy { Relevance, Modified, Name, Size, Kind }
+
+/// <summary>Optional narrowing and ordering chosen in the search window.</summary>
+public sealed record SearchFilter(IReadOnlyCollection<FileKind>? Kinds = null, SortBy Sort = SortBy.Relevance, bool Descending = true)
+{
+    public static SearchFilter None { get; } = new();
+
+    /// <summary>The usual direction for each order: newest and largest first, names A→Z.</summary>
+    public static bool DefaultDescending(SortBy s) => s is SortBy.Modified or SortBy.Size or SortBy.Relevance;
+}
+
 /// <summary>
 /// Answers queries against the index. Ranking combines, in order of weight:
 ///  how well the file name matches (exact > prefix > word prefix > substring > initials),
@@ -48,13 +59,19 @@ public sealed class SearchEngine : IDisposable
         _conn = IndexStore.Open(dbPath, readOnly: true);
     }
 
-    public List<SearchResult> Search(string query, int limit = 60, CancellationToken ct = default)
+    public List<SearchResult> Search(string query, int limit = 60, CancellationToken ct = default) =>
+        Search(query, SearchFilter.None, limit, ct);
+
+    /// <summary>Like <see cref="Search(string,int,CancellationToken)"/>, keeping only the given kinds.
+    /// With an order other than relevance, the most relevant matches (a few hundred) are re-ordered,
+    /// so "by date" means "the newest of the files that really match".</summary>
+    public List<SearchResult> Search(string query, SearchFilter filter, int limit = 60, CancellationToken ct = default)
     {
         query = query.Trim();
         var results = new List<SearchResult>();
         if (query.Length == 0) return results;
 
-        if (Calculator.TryEvaluate(query, out var value))
+        if (filter.Kinds == null && Calculator.TryEvaluate(query, out var value))
         {
             // An arithmetic expression is not a file search; its digits would only match noise.
             results.Add(new SearchResult { Id = -1, Path = "", Name = $"{query} = {value}", Kind = FileKind.Calculator, Score = 5000, Value = value });
@@ -117,9 +134,11 @@ public sealed class SearchEngine : IDisposable
                 r.Score += Bonus(r, now);
             }
 
-            var top = byId.Values.Where(r => r.Score > 0)
-                .OrderByDescending(r => r.Score).ThenBy(r => r.Name.Length).ThenBy(r => r.Path, StringComparer.OrdinalIgnoreCase)
-                .Take(limit).ToList();
+            var ranked = byId.Values.Where(r => r.Score > 0 && (filter.Kinds == null || filter.Kinds.Contains(r.Kind)))
+                .OrderByDescending(r => r.Score).ThenBy(r => r.Name.Length).ThenBy(r => r.Path, StringComparer.OrdinalIgnoreCase);
+            var top = filter.Sort == SortBy.Relevance && filter.Descending
+                ? ranked.Take(limit).ToList()
+                : Order(ranked.Take(Math.Max(limit, 300)), filter).Take(limit).ToList();
 
             foreach (var r in top.Where(r => r.ContentMatch)) FillHit(r, terms);
             results.AddRange(top);
@@ -128,6 +147,25 @@ public sealed class SearchEngine : IDisposable
     }
 
     // ---------------------------------------------------------------- scoring
+
+    private static readonly StringComparer NameOrder = StringComparer.Create(System.Globalization.CultureInfo.GetCultureInfo("zh-CN"), true);
+
+    private static IEnumerable<SearchResult> Order(IEnumerable<SearchResult> items, SearchFilter f)
+    {
+        var list = items.ToList();
+        // Stable sorts: ties keep their relevance order.
+        IOrderedEnumerable<SearchResult> sorted = f.Sort switch
+        {
+            SortBy.Modified => f.Descending ? list.OrderByDescending(r => r.Modified) : list.OrderBy(r => r.Modified),
+            SortBy.Size => f.Descending ? list.OrderByDescending(r => r.Size) : list.OrderBy(r => r.Size),
+            SortBy.Name => f.Descending ? list.OrderByDescending(r => r.Name, NameOrder) : list.OrderBy(r => r.Name, NameOrder),
+            SortBy.Kind => f.Descending
+                ? list.OrderByDescending(r => FileKinds.DisplayName(r.Kind), NameOrder).ThenByDescending(r => System.IO.Path.GetExtension(r.Name), StringComparer.OrdinalIgnoreCase)
+                : list.OrderBy(r => FileKinds.DisplayName(r.Kind), NameOrder).ThenBy(r => System.IO.Path.GetExtension(r.Name), StringComparer.OrdinalIgnoreCase),
+            _ => list.OrderBy(r => -r.Score), // relevance, reversed below when ascending
+        };
+        return f.Sort == SortBy.Relevance && !f.Descending ? list.OrderBy(r => r.Score) : sorted;
+    }
 
     private (long n, double avgChars, DateTime at) _corpus;
 

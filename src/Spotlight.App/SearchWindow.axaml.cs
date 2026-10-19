@@ -21,6 +21,80 @@ public partial class SearchWindow : Window
     private CancellationTokenSource? _searchCts;
     private string _lastQuery = "";
     private CancellationTokenSource? _previewCts;
+
+    private static readonly (string label, FileKind[]? kinds)[] KindFilters =
+    {
+        ("全部", null),
+        ("应用", new[] { FileKind.App }),
+        ("文件夹", new[] { FileKind.Folder }),
+        ("PDF", new[] { FileKind.Pdf }),
+        ("文稿", new[] { FileKind.Document }),
+        ("表格", new[] { FileKind.Spreadsheet }),
+        ("演示", new[] { FileKind.Presentation }),
+        ("图片", new[] { FileKind.Image }),
+        ("音视频", new[] { FileKind.Audio, FileKind.Video }),
+        ("文本代码", new[] { FileKind.Text, FileKind.Code }),
+        ("其他", new[] { FileKind.Archive, FileKind.Other }),
+    };
+
+    private static readonly (string label, SortBy sort)[] SortOptions =
+    {
+        ("相关", SortBy.Relevance), ("日期", SortBy.Modified), ("名称", SortBy.Name), ("大小", SortBy.Size), ("格式", SortBy.Kind),
+    };
+
+    private readonly List<Button> _kindButtons = new();
+    private readonly List<Button> _sortButtons = new();
+    private int _kindIndex;
+    private SortBy _sort = SortBy.Relevance;
+    private bool _descending = true;
+
+    private SearchFilter CurrentFilter() => new(KindFilters[_kindIndex].kinds, _sort, _descending);
+
+    private void BuildFilterBar()
+    {
+        for (int i = 0; i < KindFilters.Length; i++)
+        {
+            int index = i;
+            var b = new Button { Content = KindFilters[i].label, Classes = { "chip" } };
+            b.Click += (_, _) => SetKind(index);
+            _kindButtons.Add(b);
+            KindChips.Children.Add(b);
+        }
+        foreach (var (label, sort) in SortOptions)
+        {
+            var b = new Button { Content = label, Classes = { "chip" }, Tag = label };
+            b.Click += (_, _) =>
+            {
+                // Picking the current order again flips its direction.
+                if (_sort == sort && sort != SortBy.Relevance) _descending = !_descending;
+                else { _sort = sort; _descending = SearchFilter.DefaultDescending(sort); }
+                RefreshChips();
+                QueueSearch();
+            };
+            _sortButtons.Add(b);
+            SortChips.Children.Add(b);
+        }
+        RefreshChips();
+    }
+
+    private void SetKind(int index)
+    {
+        _kindIndex = (index + KindFilters.Length) % KindFilters.Length;
+        RefreshChips();
+        QueueSearch();
+    }
+
+    private void RefreshChips()
+    {
+        for (int i = 0; i < _kindButtons.Count; i++) _kindButtons[i].Classes.Set("on", i == _kindIndex);
+        for (int i = 0; i < _sortButtons.Count; i++)
+        {
+            var (label, sort) = SortOptions[i];
+            bool on = sort == _sort;
+            _sortButtons[i].Classes.Set("on", on);
+            _sortButtons[i].Content = on && sort != SortBy.Relevance ? label + (_descending ? " ↓" : " ↑") : label;
+        }
+    }
     private PreviewImage? _preview;
     private ResultItem? _previewItem;
 
@@ -36,6 +110,7 @@ public partial class SearchWindow : Window
         Results.ItemsSource = _items;
         TransparencyLevelHint = new[] { WindowTransparencyLevel.AcrylicBlur, WindowTransparencyLevel.Blur, WindowTransparencyLevel.None };
 
+        BuildFilterBar();
         Query.TextChanged += (_, _) => QueueSearch();
         Results.SelectionChanged += (_, _) => UpdatePreview();
         Results.DoubleTapped += (_, _) => OpenSelected(reveal: false);
@@ -127,17 +202,19 @@ public partial class SearchWindow : Window
         var query = Query.Text ?? "";
         _searchCts?.Cancel();
         var cts = _searchCts = new CancellationTokenSource();
+        FilterBar.IsVisible = !string.IsNullOrWhiteSpace(query);
         if (string.IsNullOrWhiteSpace(query))
         {
             _items.Clear();
             ResultsArea.IsVisible = false;
             return;
         }
+        var filter = CurrentFilter();
         // Short debounce so fast typing doesn't run a query per keystroke.
         Task.Delay(40, cts.Token).ContinueWith(_ =>
         {
             List<SearchResult> results;
-            try { results = _engine.Search(query, _settings.MaxResults, cts.Token); }
+            try { results = _engine.Search(query, filter, _settings.MaxResults, cts.Token); }
             catch (OperationCanceledException) { return; }
             Dispatcher.UIThread.Post(() =>
             {
@@ -176,10 +253,11 @@ public partial class SearchWindow : Window
         var query = Query.Text ?? "";
         if (query != _lastQuery || string.IsNullOrWhiteSpace(query)) return;
         long? selected = (Results.SelectedItem as ResultItem)?.Result.Id;
+        var filter = CurrentFilter();
         Task.Run(() =>
         {
             List<SearchResult> results;
-            try { results = _engine.Search(query, _settings.MaxResults); }
+            try { results = _engine.Search(query, filter, _settings.MaxResults); }
             catch (Exception) { return; }
             Dispatcher.UIThread.Post(() => { if (query == _lastQuery && IsVisible) ShowResults(results, selected); });
         });
@@ -305,6 +383,10 @@ public partial class SearchWindow : Window
             case Key.Escape:
                 if (!string.IsNullOrEmpty(Query.Text)) Query.Text = "";
                 else HideSearch();
+                e.Handled = true;
+                break;
+            case Key.Tab when FilterBar.IsVisible:
+                SetKind(_kindIndex + (e.KeyModifiers.HasFlag(KeyModifiers.Shift) ? -1 : 1));
                 e.Handled = true;
                 break;
             case Key.Down:
