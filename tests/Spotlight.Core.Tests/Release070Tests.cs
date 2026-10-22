@@ -94,6 +94,18 @@ public sealed class Release070Tests : IDisposable
         Assert.Contains("\"SettingsVersion\": 5", File.ReadAllText(path));
     }
 
+    [Fact]
+    public void TotalCountsEveryMatchNotOnlyTheShownOnes()
+    {
+        for (int i = 0; i < 12; i++) Write($"docs/报告{i}.md", "季度营业收入说明");
+        Index(Quiet());
+        using var e = new SearchEngine(Db);
+        var r = e.Search("营业收入", 5);
+        Assert.Equal(5, r.Count);
+        Assert.Equal(12, r.Total);
+        Assert.False(r.AtLeast);
+    }
+
     [Theory]
     [InlineData(@"D:\3.AI\codex\投研工作流程\lightodo-v0.4\dist-v0.4\Lightodo.exe", true)]
     [InlineData(@"D:\tools\Everything\Everything.exe", true)]

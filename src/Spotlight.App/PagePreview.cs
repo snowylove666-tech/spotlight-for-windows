@@ -118,19 +118,18 @@ internal static class PagePreview
 
     // ---------------------------------------------------------------- text
 
-    /// <summary>Text and code files are shown as text: up to a few thousand characters starting a
-    /// little before the first hit (or at the top).</summary>
-    internal static string? TextAround(string path, List<string> terms, CancellationToken ct)
+    /// <summary>The text of a text or code file, for the text view.</summary>
+    internal static string? ReadText(string path, CancellationToken ct)
     {
         var extractor = Spotlight.Core.Extraction.ContentExtractors.Default.For(Path.GetExtension(path));
         if (extractor == null || new FileInfo(path).Length > 64L * 1024 * 1024) return null;
-        var text = extractor.Extract(path, 4_000_000, ct);
-        int hit = -1;
-        foreach (var t in terms.Where(t => t.Length > 0))
-        {
-            int k = text.IndexOf(t, StringComparison.OrdinalIgnoreCase);
-            if (k >= 0 && (hit < 0 || k < hit)) hit = k;
-        }
+        return extractor.Extract(path, 4_000_000, ct);
+    }
+
+    /// <summary>Up to a few thousand characters starting a little before <paramref name="hit"/>
+    /// (or at the top when there is none).</summary>
+    internal static string TextWindow(string text, int hit)
+    {
         int start = hit <= 300 ? 0 : text.LastIndexOf('\n', hit - 300) + 1;
         int length = Math.Min(text.Length - start, 8000);
         return (start > 0 ? "…\n" : "") + text.Substring(start, length) + (start + length < text.Length ? "\n…" : "");

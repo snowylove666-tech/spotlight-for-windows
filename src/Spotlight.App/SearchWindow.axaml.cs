@@ -130,7 +130,8 @@ public partial class SearchWindow : Window
         };
         PrevPage.Click += (_, _) => TurnPage(-1);
         NextPage.Click += (_, _) => TurnPage(+1);
-        NextHit.Click += (_, _) => JumpToHit(+1);
+        NextHit.Click += (_, _) => StepHit(+1);
+        PrevHit.Click += (_, _) => StepHit(-1);
         PreviewScroll.AddHandler(PointerWheelChangedEvent, OnPreviewWheel, Avalonia.Interactivity.RoutingStrategies.Tunnel);
         Opened += (_, _) =>
         {
@@ -229,7 +230,7 @@ public partial class SearchWindow : Window
         // Short debounce so fast typing doesn't run a query per keystroke.
         Task.Delay(40, cts.Token).ContinueWith(_ =>
         {
-            List<SearchResult> results;
+            SearchResults results;
             try { results = _engine.Search(query, filter, _settings.MaxResults, cts.Token); }
             catch (OperationCanceledException) { return; }
             Dispatcher.UIThread.Post(() =>
@@ -241,8 +242,11 @@ public partial class SearchWindow : Window
         }, cts.Token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
     }
 
-    private void ShowResults(List<SearchResult> results, long? keepSelected = null)
+    private void ShowResults(SearchResults results, long? keepSelected = null)
     {
+        ResultCount.Text = results.Total > results.Count
+            ? $"共 {results.Total:N0}{(results.AtLeast ? "+" : "")} 项，显示前 {results.Count} 项"
+            : $"共 {results.Count} 项";
         _items.Clear();
         foreach (var r in results) _items.Add(new ResultItem(r));
         ResultsArea.IsVisible = _items.Count > 0;
@@ -272,7 +276,7 @@ public partial class SearchWindow : Window
         var filter = CurrentFilter();
         Task.Run(() =>
         {
-            List<SearchResult> results;
+            SearchResults results;
             try { results = _engine.Search(query, filter, _settings.MaxResults); }
             catch (Exception) { return; }
             Dispatcher.UIThread.Post(() => { if (query == _lastQuery && IsVisible) ShowResults(results, selected); });
@@ -293,6 +297,9 @@ public partial class SearchWindow : Window
         if (item.Icon == null)
             item.PropertyChanged += (_, _) => { if (Results.SelectedItem == item) { PreviewIcon.Source = item.Icon; PreviewGlyph.Text = ""; } };
         PreviewScroll.Offset = default;
+        _hitIndex = 0;
+        _text = null;
+        UpdateHitInfo(item);
         LoadPagePreview(item);
     }
 
@@ -302,7 +309,7 @@ public partial class SearchWindow : Window
 
     private IntPtr TopHandle => TryGetPlatformHandle()?.Handle ?? IntPtr.Zero;
 
-    private void LoadPagePreview(ResultItem item, int? page = null, bool allowHandler = true, bool atEnd = false)
+    private void LoadPagePreview(ResultItem item, int? page = null, bool allowHandler = true, bool atEnd = false, int box = 0)
     {
         _previewCts?.Cancel();
         if (_previewItem != item) ClearPreviewImage();
@@ -312,7 +319,7 @@ public partial class SearchWindow : Window
         // Only content hits have words worth marking; a name match shows the first page.
         var terms = r.ContentMatch ? TextTokenizer.QueryTerms(_lastQuery) : new List<string>();
         if (allowHandler && UsesHandler(r)) { LoadHandler(item, cts); return; }
-        if (SheetPreview.CanPreview(r.Path)) { LoadSheet(item, terms, cts); return; }
+        if (SheetPreview.CanPreview(r.Path)) { LoadSheet(item, terms, cts, _hitIndex); return; }
         if (r.Kind is FileKind.Text or FileKind.Code || System.IO.Path.GetExtension(r.Path).Equals(".csv", StringComparison.OrdinalIgnoreCase))
         {
             LoadText(item, terms, cts);
@@ -332,7 +339,7 @@ public partial class SearchWindow : Window
             Dispatcher.UIThread.Post(() =>
             {
                 if (cts.IsCancellationRequested || Results.SelectedItem != item || !IsVisible) { img?.Bitmap.Dispose(); return; }
-                ShowPreviewImage(item, img, width, scale, atEnd);
+                ShowPreviewImage(item, img, width, scale, atEnd, box);
             });
         }, cts.Token);
     }
@@ -374,14 +381,14 @@ public partial class SearchWindow : Window
 
     // ---------------------------------------------------------------- spreadsheets
 
-    private void LoadSheet(ResultItem item, List<string> terms, CancellationTokenSource cts)
+    private void LoadSheet(ResultItem item, List<string> terms, CancellationTokenSource cts, int skip = 0)
     {
         var path = item.Result.Path;
         _ = Task.Run(async () =>
         {
             await Task.Delay(80, cts.Token);
             SheetView? sheet;
-            try { sheet = SheetPreview.Read(path, terms, cts.Token); }
+            try { sheet = SheetPreview.Read(path, terms, cts.Token, skip); }
             catch (Exception e) when (e is not OperationCanceledException) { sheet = null; }
             Dispatcher.UIThread.Post(() =>
             {
@@ -453,13 +460,18 @@ public partial class SearchWindow : Window
         {
             await Task.Delay(60, cts.Token);
             string? text;
-            try { text = PagePreview.TextAround(path, terms, cts.Token); }
+            try { text = PagePreview.ReadText(path, cts.Token); }
             catch (Exception e) when (e is not OperationCanceledException) { text = null; }
+            var hits = text == null ? new List<int>() : SearchEngine.HitOffsets(text, terms, 5000);
             Dispatcher.UIThread.Post(() =>
             {
                 if (cts.IsCancellationRequested || Results.SelectedItem != item || string.IsNullOrEmpty(text)) return;
                 _previewItem = item;
-                PreviewText.Inlines = Highlight(text, _lastQuery);
+                _text = text;
+                _textHits = hits;
+                _hitIndex = 0;
+                ShowTextWindow();
+                UpdateHitInfo(item);
                 TextFrame.IsVisible = true;
                 // The snippet repeats what the text view shows.
                 PreviewSnippet.IsVisible = false;
@@ -513,7 +525,7 @@ public partial class SearchWindow : Window
         TurnPage(down ? +1 : -1, atEnd: !down);
     }
 
-    private void ShowPreviewImage(ResultItem item, PreviewImage? img, double width, double scale, bool atEnd = false)
+    private void ShowPreviewImage(ResultItem item, PreviewImage? img, double width, double scale, bool atEnd = false, int box = 0)
     {
         ClearPreviewImage();
         if (img == null) return;
@@ -527,11 +539,11 @@ public partial class SearchWindow : Window
         PageImage.Width = HitLayer.Width = w;
         PageImage.Height = HitLayer.Height = h;
         var brush = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "PageHitBrush") ?? Brushes.Yellow;
-        foreach (var box in img.Highlights)
+        foreach (var hit in img.Highlights)
         {
-            var mark = new Rectangle { Width = box.Width * w + 4, Height = box.Height * h + 4, Fill = brush, RadiusX = 2, RadiusY = 2 };
-            Canvas.SetLeft(mark, box.X * w - 2);
-            Canvas.SetTop(mark, box.Y * h - 2);
+            var mark = new Rectangle { Width = hit.Width * w + 4, Height = hit.Height * h + 4, Fill = brush, RadiusX = 2, RadiusY = 2 };
+            Canvas.SetLeft(mark, hit.X * w - 2);
+            Canvas.SetTop(mark, hit.Y * h - 2);
             HitLayer.Children.Add(mark);
         }
         PageFrame.IsVisible = true;
@@ -540,16 +552,97 @@ public partial class SearchWindow : Window
         PageNav.IsVisible = img.Page != null;
         PrevPage.IsEnabled = img.Page > 1;
         NextPage.IsEnabled = img.Page < img.PageCount;
-        NextHit.IsVisible = item.Result.ContentMatch;
+        NextHit.IsVisible = PrevHit.IsVisible = item.Result.ContentMatch;
         if (atEnd)
             Dispatcher.UIThread.Post(() => PreviewScroll.Offset = new Vector(0, PreviewScroll.Extent.Height), DispatcherPriority.Background);
-        else if (img.Highlights.Count > 0)
-        {
-            // Bring the first hit into view, a little below the top edge.
-            double y = img.Highlights.Min(b => b.Y) * h;
-            Dispatcher.UIThread.Post(() => PreviewScroll.Offset = new Vector(0, Math.Max(0, PageFrame.Bounds.Y + y - 60)), DispatcherPriority.Background);
-        }
+        else if (img.Highlights.Count > 0) ScrollToHighlight(box);
         else Dispatcher.UIThread.Post(() => PreviewScroll.Offset = default, DispatcherPriority.Background);
+    }
+
+    /// <summary>Brings the n-th marked word of the page (top to bottom) into view, a little below the top edge.</summary>
+    private void ScrollToHighlight(int n)
+    {
+        if (_preview is not { Highlights.Count: > 0 } img) return;
+        var boxes = img.Highlights.OrderBy(b => Math.Round(b.Y, 3)).ThenBy(b => b.X).ToList();
+        double y = boxes[Math.Clamp(n, 0, boxes.Count - 1)].Y * PageImage.Height;
+        Dispatcher.UIThread.Post(() => PreviewScroll.Offset = new Vector(0, Math.Max(0, PageFrame.Bounds.Y + y - 60)), DispatcherPriority.Background);
+    }
+
+    // ---------------------------------------------------------------- hit to hit (Ctrl+↑/↓)
+
+    private int _hitIndex;
+    private string? _text;            // text view: the whole text
+    private List<int> _textHits = new();
+
+    /// <summary>"文件内 12 处命中 · 第 3 处" above the preview.</summary>
+    private void UpdateHitInfo(ResultItem item)
+    {
+        var r = item.Result;
+        int total = _text != null ? _textHits.Count : r.HitCount;
+        if (!r.ContentMatch || total <= 0) { HitInfo.Text = r.ContentMatch ? "文件名和正文都匹配" : ""; return; }
+        bool steppable = r.HitPages != null || _text != null || SheetPreview.CanPreview(r.Path);
+        HitInfo.Text = steppable
+            ? $"文件内 {total:N0} 处命中 · 第 {_hitIndex + 1} 处      Ctrl+↑↓ 切换"
+            : $"文件内 {total:N0} 处命中";
+    }
+
+    private void StepHit(int step)
+    {
+        if (Results.SelectedItem is not ResultItem item || !item.Result.ContentMatch) return;
+        var r = item.Result;
+        if (_text != null && _previewItem == item)
+        {
+            int next = _hitIndex + step;
+            if (next < 0 || next >= _textHits.Count) return;
+            _hitIndex = next;
+            ShowTextWindow();
+        }
+        else if (r.Kind == FileKind.Pdf && r.HitPages is { Count: > 0 } pages)
+        {
+            int next = _hitIndex + step;
+            if (next < 0 || next >= pages.Count) return;
+            _hitIndex = next;
+            int page = pages[next];
+            int box = next - pages.ToList().IndexOf(page); // which hit on that page
+            if (_previewItem == item && _preview?.Page == page) ScrollToHighlight(box);
+            else LoadPagePreview(item, page, box: box);
+        }
+        else if (r.Kind == FileKind.Pdf)
+        {
+            JumpToHit(step); // index from before 0.4.0: find the page in the PDF itself
+            return;
+        }
+        else if (SheetPreview.CanPreview(r.Path))
+        {
+            int next = _hitIndex + step;
+            if (next < 0) return;
+            var terms = TextTokenizer.QueryTerms(_lastQuery);
+            var path = r.Path;
+            _ = Task.Run(() =>
+            {
+                SheetView? sheet;
+                try { sheet = SheetPreview.Read(path, terms, CancellationToken.None, next); }
+                catch (Exception) { sheet = null; }
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (sheet == null || Results.SelectedItem != item) return; // no further matching row
+                    _hitIndex = next;
+                    ShowSheet(sheet, terms);
+                    UpdateHitInfo(item);
+                });
+            });
+            return;
+        }
+        else return;
+        UpdateHitInfo(item);
+    }
+
+    private void ShowTextWindow()
+    {
+        if (_text == null) return;
+        int at = _hitIndex < _textHits.Count ? _textHits[_hitIndex] : -1;
+        PreviewText.Inlines = Highlight(PagePreview.TextWindow(_text, at), _lastQuery);
+        PreviewScroll.Offset = default;
     }
 
     private void ClearPreviewImage()
@@ -610,6 +703,10 @@ public partial class SearchWindow : Window
                 SetKind(_kindIndex + (e.KeyModifiers.HasFlag(KeyModifiers.Shift) ? -1 : 1));
                 e.Handled = true;
                 break;
+            case Key.Down when ctrl:
+                StepHit(+1); e.Handled = true; break;
+            case Key.Up when ctrl:
+                StepHit(-1); e.Handled = true; break;
             case Key.Down:
                 Move(+1); e.Handled = true; break;
             case Key.Up:
@@ -624,8 +721,6 @@ public partial class SearchWindow : Window
                 TurnPage(+1); e.Handled = true; break;
             case Key.Left when ctrl && PageNav.IsVisible:
                 TurnPage(-1); e.Handled = true; break;
-            case Key.F3 when PageNav.IsVisible:
-                JumpToHit(e.KeyModifiers.HasFlag(KeyModifiers.Shift) ? -1 : +1); e.Handled = true; break;
             case Key.C when ctrl && e.KeyModifiers.HasFlag(KeyModifiers.Shift):
                 if (Results.SelectedItem is ResultItem it) _ = Clipboard?.SetTextAsync(it.Result.Kind == FileKind.Calculator ? it.Result.Value : it.Result.Path);
                 e.Handled = true;

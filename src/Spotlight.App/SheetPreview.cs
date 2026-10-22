@@ -19,8 +19,9 @@ internal static class SheetPreview
 
     /// <summary>The first sheet with a cell containing a term (or the first sheet), from a few rows
     /// above that cell. Row 1 is kept on top as the header.</summary>
-    public static SheetView? Read(string path, List<string> terms, CancellationToken ct)
+    public static SheetView? Read(string path, List<string> terms, CancellationToken ct, int skip = 0)
     {
+        int matched = 0;
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var reader = ExcelReaderFactory.CreateReader(stream);
         SheetView? first = null;
@@ -35,7 +36,8 @@ internal static class SheetPreview
                 var cells = new string[Math.Min(reader.FieldCount, MaxColumns)];
                 for (int i = 0; i < cells.Length; i++) cells[i] = Format(reader.GetValue(i));
                 rows.Add(cells);
-                if (terms.Count > 0 && cells.Any(c => terms.Any(t => c.Contains(t, StringComparison.OrdinalIgnoreCase))))
+                if (terms.Count > 0 && cells.Any(c => terms.Any(t => c.Contains(t, StringComparison.OrdinalIgnoreCase)))
+                    && matched++ >= skip) // Ctrl+↓ asks for the next matching row
                 {
                     hit = rows.Count - 1;
                     // Read on just far enough to fill the window.
@@ -50,7 +52,7 @@ internal static class SheetPreview
                 if (terms.Count == 0 && rows.Count >= RowsShown) break;
             }
             if (hit >= 0) return Window(reader.Name, reader.ResultsCount, rows, hit);
-            first ??= Window(reader.Name, reader.ResultsCount, rows, 0);
+            if (skip == 0) first ??= Window(reader.Name, reader.ResultsCount, rows, 0);
             if (terms.Count == 0 || DateTime.UtcNow >= until) break;
         } while (reader.NextResult());
         return first;

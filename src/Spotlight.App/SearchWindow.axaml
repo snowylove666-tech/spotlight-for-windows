@@ -103,7 +103,12 @@
           <RowDefinition Height="Auto" />
           <RowDefinition Height="*" />
         </Grid.RowDefinitions>
-        <Border Grid.ColumnSpan="3" Height="1" Background="{DynamicResource DividerBrush}" />
+        <!-- How many results in all (left) and how many hits inside the selected file (right). -->
+        <TextBlock x:Name="ResultCount" FontSize="11" Margin="18,6,10,6" Foreground="{DynamicResource TextSecondary}" />
+        <TextBlock x:Name="HitInfo" Grid.Column="2" FontSize="11" Margin="20,6,18,6" TextTrimming="CharacterEllipsis"
+                   Foreground="{DynamicResource TextSecondary}" />
+        <Border Grid.ColumnSpan="3" Height="1" VerticalAlignment="Top" Background="{DynamicResource DividerBrush}" />
+        <Border Grid.ColumnSpan="3" Height="1" VerticalAlignment="Bottom" Background="{DynamicResource DividerBrush}" />
 
         <ListBox x:Name="Results" Grid.Row="1" Background="Transparent" Padding="0,6"
                  x:DataType="local:ResultItem">
@@ -167,7 +172,7 @@
         </ScrollViewer>
         <!-- Word, Excel, PowerPoint…: drawn by the preview handler Explorer uses. -->
         <local:PreviewHandlerHost x:Name="Handler" IsVisible="False" Margin="10,10,10,6" />
-        <!-- Page turning for PDFs: buttons, Ctrl+←/→, F3, or the mouse wheel past the page edge.
+        <!-- Page turning for PDFs: buttons, Ctrl+←/→, Ctrl+↑/↓ (hit to hit), or the mouse wheel past the page edge.
              Kept below the scrolling page so it is always at hand. -->
         <Border x:Name="PageNav" Grid.Row="1" IsVisible="False" HorizontalAlignment="Center" Margin="0,0,0,8"
                 Padding="4,2" CornerRadius="14" Background="{DynamicResource BarBrush}" BoxShadow="0 1 6 0 #40000000">
@@ -176,7 +181,8 @@
             <TextBlock x:Name="PageLabel" FontSize="11" VerticalAlignment="Center" Margin="6,0"
                        Foreground="{DynamicResource TextSecondary}" />
             <Button x:Name="NextPage" Classes="chip" Content="下一页 ›" ToolTip.Tip="Ctrl+→" />
-            <Button x:Name="NextHit" Classes="chip" Content="下一处命中 ↓" ToolTip.Tip="F3（Shift+F3 上一处）" />
+            <Button x:Name="PrevHit" Classes="chip" Content="↑ 上一处" ToolTip.Tip="Ctrl+↑" />
+            <Button x:Name="NextHit" Classes="chip" Content="下一处 ↓" ToolTip.Tip="Ctrl+↓" />
           </StackPanel>
         </Border>
         <StackPanel x:Name="HandlerCaption" Grid.Row="1" IsVisible="False" Margin="14,0,14,10" Spacing="2">
@@ -193,7 +199,7 @@
         <Grid ColumnDefinitions="*,Auto">
           <TextBlock x:Name="Status" FontSize="11" Foreground="{DynamicResource TextSecondary}" TextTrimming="CharacterEllipsis" />
           <TextBlock Grid.Column="1" FontSize="11" Foreground="{DynamicResource TextSecondary}"
-                     Text="↵ 打开   Ctrl+↵ 打开位置   Tab 切换类型   Ctrl+←/→ 翻页   F3 下一处   Esc 关闭" />
+                     Text="↵ 打开   Ctrl+↵ 打开位置   Tab 切换类型   Ctrl+←/→ 翻页   Ctrl+↑/↓ 上/下一处   Esc 关闭" />
         </Grid>
       </Border>
     </StackPanel>

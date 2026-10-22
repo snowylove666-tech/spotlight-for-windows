@@ -21,6 +21,8 @@ public sealed class SearchResult
     public int? Page { get; set; }
     /// <summary>How many times the query terms occur in the document text (content hits only).</summary>
     public int HitCount { get; set; }
+    /// <summary>PDFs: the page of each occurrence, in reading order (for stepping from hit to hit).</summary>
+    public IReadOnlyList<int>? HitPages { get; set; }
     /// <summary>A document whose text has not been read yet (so a content search can't find it yet).</summary>
     public bool ContentPending { get; init; }
     internal int ContentChars { get; init; }
@@ -30,6 +32,15 @@ public sealed class SearchResult
     internal long LastLaunch { get; init; }
 
     public override string ToString() => $"{Score,7:F1}  {FileKinds.DisplayName(Kind),-4} {Name}  ({Path})";
+}
+
+/// <summary>The results shown, plus how many matched in all.</summary>
+public sealed class SearchResults : List<SearchResult>
+{
+    /// <summary>Every match, not only the ones returned.</summary>
+    public int Total { get; set; }
+    /// <summary>The candidate lists hit their caps, so <see cref="Total"/> is a lower bound.</summary>
+    public bool AtLeast { get; set; }
 }
 
 public enum SortBy { Relevance, Modified, Name, Size, Kind }
@@ -59,22 +70,23 @@ public sealed class SearchEngine : IDisposable
         _conn = IndexStore.Open(dbPath, readOnly: true);
     }
 
-    public List<SearchResult> Search(string query, int limit = 60, CancellationToken ct = default) =>
+    public SearchResults Search(string query, int limit = 60, CancellationToken ct = default) =>
         Search(query, SearchFilter.None, limit, ct);
 
     /// <summary>Like <see cref="Search(string,int,CancellationToken)"/>, keeping only the given kinds.
     /// With an order other than relevance, the most relevant matches (a few hundred) are re-ordered,
     /// so "by date" means "the newest of the files that really match".</summary>
-    public List<SearchResult> Search(string query, SearchFilter filter, int limit = 60, CancellationToken ct = default)
+    public SearchResults Search(string query, SearchFilter filter, int limit = 60, CancellationToken ct = default)
     {
         query = query.Trim();
-        var results = new List<SearchResult>();
+        var results = new SearchResults();
         if (query.Length == 0) return results;
 
         if (filter.Kinds == null && Calculator.TryEvaluate(query, out var value))
         {
             // An arithmetic expression is not a file search; its digits would only match noise.
             results.Add(new SearchResult { Id = -1, Path = "", Name = $"{query} = {value}", Kind = FileKind.Calculator, Score = 5000, Value = value });
+            results.Total = 1;
             return results;
         }
 
@@ -90,7 +102,9 @@ public sealed class SearchEngine : IDisposable
             // 1. Candidates by name: FTS token match, plus whole-name prefix via the B-tree index
             //    (so "a" still finds "a.txt" even when thousands of names contain an "a…" word).
             var ids = new HashSet<long>();
-            ids.UnionWith(QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 3000;", ("$q", fts)));
+            var nameIds = QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 3000;", ("$q", fts));
+            bool capped = nameIds.Count >= 3000;
+            ids.UnionWith(nameIds);
             ids.UnionWith(QueryIds("SELECT id FROM files WHERE name_lower >= $lo AND name_lower < $hi LIMIT 300;", ("$lo", qLower), ("$hi", qLower + '￿')));
             // Few hits: also try plain substring ("port" inside "report") which token matching can't do.
             if (ids.Count < 50 && qLower.Length >= 2)
@@ -110,6 +124,7 @@ public sealed class SearchEngine : IDisposable
             {
                 var hits = QueryHits("SELECT rowid, bm25(content_fts) FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 1000;", fts);
                 ct.ThrowIfCancellationRequested();
+                capped |= hits.Count >= 1000;
                 foreach (var r in LoadRows(hits.Select(h => h.id).Where(id => !byId.ContainsKey(id)))) byId[r.Id] = r;
                 var scores = ContentScores(hits, byId, terms.Count == 1 ? fts : null);
                 for (int i = 0; i < hits.Count; i++)
@@ -142,6 +157,8 @@ public sealed class SearchEngine : IDisposable
 
             foreach (var r in top.Where(r => r.ContentMatch)) FillHit(r, terms);
             results.AddRange(top);
+            results.Total = byId.Values.Count(r => r.Score > 0 && (filter.Kinds == null || filter.Kinds.Contains(r.Kind)));
+            results.AtLeast = capped;
         }
         return results;
     }
@@ -413,8 +430,18 @@ public sealed class SearchEngine : IDisposable
         r.HitCount = CountHits(text, terms);
         // Indexes built before 0.4.0 kept no newlines; the app then looks the page up in the PDF itself.
         if (r.Kind != FileKind.Pdf || text.IndexOf('\n') < 0) return;
-        int at = FirstHit(text, terms, out _);
-        if (at >= 0) r.Page = 1 + text.AsSpan(0, at).Count('\n');
+        var hits = HitOffsets(text, terms, 5000);
+        if (hits.Count == 0) return;
+        var pages = new List<int>(hits.Count);
+        int page = 1, scanned = 0;
+        foreach (var at in hits)
+        {
+            page += text.AsSpan(scanned, at - scanned).Count('\n');
+            scanned = at;
+            pages.Add(page);
+        }
+        r.HitPages = pages;
+        r.Page = pages[0];
     }
 
     /// <summary>Occurrences of the terms in the text, for "11 处" in the result list.</summary>
@@ -425,6 +452,17 @@ public sealed class SearchEngine : IDisposable
             for (int i = text.IndexOf(t, StringComparison.OrdinalIgnoreCase); i >= 0; i = text.IndexOf(t, i + t.Length, StringComparison.OrdinalIgnoreCase))
                 n++;
         return n;
+    }
+
+    /// <summary>Start of each occurrence of the terms, in text order (at most <paramref name="max"/>).</summary>
+    public static List<int> HitOffsets(string text, List<string> terms, int max)
+    {
+        var all = new List<int>();
+        foreach (var t in terms.Where(t => t.Length > 0))
+            for (int i = text.IndexOf(t, StringComparison.OrdinalIgnoreCase); i >= 0 && all.Count < max * 4; i = text.IndexOf(t, i + t.Length, StringComparison.OrdinalIgnoreCase))
+                all.Add(i);
+        all.Sort();
+        return all.Take(max).ToList();
     }
 
     internal static int FirstHit(string text, List<string> terms, out int length)
