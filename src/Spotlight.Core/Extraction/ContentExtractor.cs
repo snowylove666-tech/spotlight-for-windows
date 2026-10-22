@@ -15,6 +15,7 @@ public sealed class ContentExtractors
     {
         new PdfExtractor(),
         new OpenXmlExtractor(),
+        new XlsExtractor(),
         new HtmlExtractor(),
         new PlainTextExtractor(),
     };

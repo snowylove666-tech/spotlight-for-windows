@@ -227,9 +227,68 @@ public sealed class IndexStore : IDisposable
         var kind = FileKinds.FromExtension(ext);
         // Only shortcuts count as "apps" everywhere; a bare .exe is an app only inside the Start Menu,
         // otherwise every installer in Downloads would be ranked like an application.
-        if (kind == FileKind.App && ext == ".exe" && !_appRoots.Any(r => path.StartsWith(r, StringComparison.OrdinalIgnoreCase)))
+        if (kind == FileKind.App && ext == ".exe" && !_appRoots.Any(r => path.StartsWith(r, StringComparison.OrdinalIgnoreCase))
+            && !LooksLikeAppExe(path))
             return FileKind.Other;
         return kind;
+    }
+
+    private static readonly string[] NotAppWords =
+        { "setup", "install", "uninst", "unins0", "update", "upgrade", "patch", "redist", "crash", "report", "helper", "service", "elevat", "debug", "test" };
+    private static readonly string[] NotAppFolders = { "downloads", "temp", "tmp", "cache", "updates", "pending", "backup", "$recycle.bin", "installer" };
+
+    /// <summary>
+    /// A portable or self-built program outside the Start Menu (e.g. D:\tools\lightodo-v0.4\dist\Lightodo.exe):
+    /// the exe is named like one of its three nearest folders. That picks the main program of a folder
+    /// and skips its helpers (crash reporters, updaters) as well as installers lying in Downloads.
+    /// </summary>
+    internal static bool LooksLikeAppExe(string path)
+    {
+        string stem = Letters(Path.GetFileNameWithoutExtension(path));
+        if (stem.Length < 3 || NotAppWords.Any(stem.Contains)) return false;
+        var dir = Path.GetDirectoryName(path);
+        for (int i = 0; i < 3 && !string.IsNullOrEmpty(dir); i++)
+        {
+            var name = Path.GetFileName(dir);
+            if (string.IsNullOrEmpty(name)) break;
+            if (NotAppFolders.Contains(name.ToLowerInvariant())) return false;
+            var folder = Letters(name);
+            if (folder.Length >= 3 && (folder.Contains(stem) || stem.Contains(folder))) return true;
+            dir = Path.GetDirectoryName(dir);
+        }
+        return false;
+    }
+
+    private static string Letters(string s) => new(s.ToLowerInvariant().Where(char.IsLetter).ToArray());
+
+    /// <summary>Re-applies the app rules to every indexed .exe (they changed in 0.7.0; rows are
+    /// otherwise only classified when first inserted).</summary>
+    public int ReclassifyExecutables()
+    {
+        var changes = new List<(long id, FileKind kind)>();
+        lock (_lock)
+        {
+            using (var c = Cmd("SELECT id, path, kind FROM files WHERE ext = '.exe';"))
+            using (var r = c.ExecuteReader())
+                while (r.Read())
+                {
+                    var kind = ClassifyFile(r.GetString(1), ".exe");
+                    if ((int)kind != r.GetInt32(2)) changes.Add((r.GetInt64(0), kind));
+                }
+            if (changes.Count == 0) return 0;
+            using var tx = _conn.BeginTransaction();
+            foreach (var (id, kind) in changes)
+            {
+                using var u = _conn.CreateCommand();
+                u.Transaction = tx;
+                u.CommandText = "UPDATE files SET kind = $k WHERE id = $id;";
+                u.Parameters.AddWithValue("$k", (int)kind);
+                u.Parameters.AddWithValue("$id", id);
+                u.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+        return changes.Count;
     }
 
     private static string DisplayName(string fileName, string ext, FileKind kind) =>

@@ -1,5 +1,5 @@
 ﻿; Installer for SpotlightWin (Inno Setup 6). Build with installer\build.ps1, which publishes the app
-; and passes the version:  ISCC /DAppVersion=0.6.1 installer\SpotlightWin.iss
+; and passes the version:  ISCC /DAppVersion=0.7.0 installer\SpotlightWin.iss
 ;
 ; Per-user install (no administrator rights): %LocalAppData%\Programs\SpotlightWin, a Start Menu
 ; shortcut, an optional desktop shortcut, "start with Windows" (on by default) and an uninstaller.

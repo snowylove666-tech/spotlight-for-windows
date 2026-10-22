@@ -34,12 +34,12 @@ internal static class PagePreview
          || ImageExts.Contains(Path.GetExtension(r.Path).ToLowerInvariant()));
 
     /// <summary>Returns null when there is nothing better to show than the icon.</summary>
-    public static async Task<PreviewImage?> RenderAsync(SearchResult r, List<string> terms, int widthPx, CancellationToken ct)
+    public static async Task<PreviewImage?> RenderAsync(SearchResult r, List<string> terms, int widthPx, CancellationToken ct, int? page = null)
     {
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 17763)) return null;
         try
         {
-            if (r.Kind == FileKind.Pdf) return await RenderPdfAsync(r.Path, r.Page, terms, widthPx, ct);
+            if (r.Kind == FileKind.Pdf) return await RenderPdfAsync(r.Path, page ?? r.Page, terms, widthPx, ct);
             if (ImageExts.Contains(Path.GetExtension(r.Path).ToLowerInvariant()))
                 return await Task.Run(() => LoadImage(r.Path, widthPx), ct);
             return await ShellThumbnail(r.Path, Math.Min(1024, widthPx), ct);
@@ -99,6 +99,41 @@ internal static class PagePreview
             }
         }
         return (1, count, new List<Rect>());
+    }
+
+    /// <summary>The nearest page after (<paramref name="step"/> = 1) or before (-1) <paramref name="from"/>
+    /// that contains one of the terms, or null. Gives up after a few seconds on huge books.</summary>
+    internal static int? FindHitPage(string path, int from, int step, List<string> terms, CancellationToken ct)
+    {
+        if (terms.Count == 0) return null;
+        using var doc = PdfDocument.Open(path, new ParsingOptions { UseLenientParsing = true, SkipMissingFonts = true });
+        var until = DateTime.UtcNow.AddSeconds(6);
+        for (int i = from + step; i >= 1 && i <= doc.NumberOfPages && DateTime.UtcNow < until; i += step)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (SafeBoxes(doc, i, terms).Count > 0) return i;
+        }
+        return null;
+    }
+
+    // ---------------------------------------------------------------- text
+
+    /// <summary>Text and code files are shown as text: up to a few thousand characters starting a
+    /// little before the first hit (or at the top).</summary>
+    internal static string? TextAround(string path, List<string> terms, CancellationToken ct)
+    {
+        var extractor = Spotlight.Core.Extraction.ContentExtractors.Default.For(Path.GetExtension(path));
+        if (extractor == null || new FileInfo(path).Length > 64L * 1024 * 1024) return null;
+        var text = extractor.Extract(path, 4_000_000, ct);
+        int hit = -1;
+        foreach (var t in terms.Where(t => t.Length > 0))
+        {
+            int k = text.IndexOf(t, StringComparison.OrdinalIgnoreCase);
+            if (k >= 0 && (hit < 0 || k < hit)) hit = k;
+        }
+        int start = hit <= 300 ? 0 : text.LastIndexOf('\n', hit - 300) + 1;
+        int length = Math.Min(text.Length - start, 8000);
+        return (start > 0 ? "…\n" : "") + text.Substring(start, length) + (start + length < text.Length ? "\n…" : "");
     }
 
     private static List<Rect> SafeBoxes(PdfDocument doc, int pageNumber, List<string> terms)
@@ -207,7 +242,7 @@ internal static class PagePreview
     }
 
     /// <summary>Online-only cloud files would be downloaded just to draw a preview.</summary>
-    private static bool IsCloudOnly(string path)
+    internal static bool IsCloudOnly(string path)
     {
         try
         {

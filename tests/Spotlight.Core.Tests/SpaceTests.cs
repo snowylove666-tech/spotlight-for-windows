@@ -38,6 +38,13 @@ public sealed class SpaceTests : IDisposable
         ContentCategories = Enum.GetNames<ContentCategory>().Where(n => n != "None").ToList(),
     };
 
+    // Documents only, as before 0.7.0 made spreadsheets a default too.
+    private static Settings DocumentsOnly() => new()
+    {
+        PauseContentIndexingOnBattery = false,
+        ContentCategories = new() { "Pdf", "Word", "Presentation", "Text" },
+    };
+
     [Fact]
     public void OnlyDocumentsHaveTheirTextReadByDefault()
     {
@@ -46,8 +53,9 @@ public sealed class SpaceTests : IDisposable
         Assert.True(s.WantsContentFor(".docx", @"D:\a\b.docx"));
         Assert.True(s.WantsContentFor(".pptx", @"D:\a\b.pptx"));
         Assert.True(s.WantsContentFor(".md", @"D:\a\b.md"));
-        Assert.False(s.WantsContentFor(".xlsx", @"D:\a\b.xlsx"));
-        Assert.False(s.WantsContentFor(".csv", @"D:\a\b.csv"));
+        Assert.True(s.WantsContentFor(".xlsx", @"D:\a\b.xlsx"));
+        Assert.True(s.WantsContentFor(".xls", @"D:\a\b.xls"));
+        Assert.True(s.WantsContentFor(".csv", @"D:\a\b.csv"));
         Assert.False(s.WantsContentFor(".log", @"D:\a\b.log"));
         Assert.False(s.WantsContentFor(".json", @"D:\a\b.json"));
         Assert.False(s.WantsContentFor(".py", @"D:\a\b.py"));
@@ -78,7 +86,7 @@ public sealed class SpaceTests : IDisposable
         Index(Everything());
         using (var e = new SearchEngine(Db)) Assert.Equal(3, e.Search("zebra").Count(r => r.ContentMatch));
 
-        Index(new Settings { PauseContentIndexingOnBattery = false }); // the indexer purges on start
+        Index(DocumentsOnly()); // the indexer purges on start
         using var e2 = new SearchEngine(Db);
         var hit = Assert.Single(e2.Search("zebra"), r => r.ContentMatch);
         Assert.Equal("notes.txt", hit.Name);
@@ -99,7 +107,7 @@ public sealed class SpaceTests : IDisposable
         long before = new FileInfo(Db).Length;
 
         var target = Path.Combine(_dir, "moved", "index.db");
-        IndexStore.Relocate(Db, target, new Settings());
+        IndexStore.Relocate(Db, target, DocumentsOnly());
         Assert.False(File.Exists(Db));
         Assert.True(new FileInfo(target).Length < before / 2);
         using (var e = new SearchEngine(target))
@@ -133,7 +141,7 @@ public sealed class SpaceTests : IDisposable
         var s = Settings.Load(path);
         Assert.Equal(Settings.DefaultContentCategories(), s.ContentCategories);
         Assert.NotNull(s.IndexFolder);
-        Assert.Contains("\"SettingsVersion\": 4", File.ReadAllText(path));
+        Assert.Contains("\"SettingsVersion\": 5", File.ReadAllText(path));
         Assert.Equal(s.IndexFolder, Settings.Load(path).IndexFolder);
     }
 }

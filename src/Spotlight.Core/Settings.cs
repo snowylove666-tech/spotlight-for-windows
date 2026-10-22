@@ -5,7 +5,7 @@ namespace Spotlight.Core;
 
 public sealed class Settings
 {
-    public const int CurrentVersion = 4;
+    public const int CurrentVersion = 5;
 
     /// <summary>Format version of this file; older files are upgraded on load.</summary>
     public int SettingsVersion { get; set; } = 1; // files from 0.1.0 have no version field
@@ -43,7 +43,15 @@ public sealed class Settings
     public List<string> ContentCategories { get; set; } = DefaultContentCategories();
 
     public static List<string> DefaultContentCategories() =>
-        new() { nameof(ContentCategory.Pdf), nameof(ContentCategory.Word), nameof(ContentCategory.Presentation), nameof(ContentCategory.Text) };
+        new() { nameof(ContentCategory.Pdf), nameof(ContentCategory.Word), nameof(ContentCategory.Presentation), nameof(ContentCategory.Text), nameof(ContentCategory.Spreadsheet) };
+
+    /// <summary>"完整正文索引": read the text of every kind of file that has any (code, logs, config,
+    /// web pages too), also inside the name-only folders, and whole spreadsheets. Finds more, at the
+    /// cost of a larger index. The narrower choices are kept and apply again when it is turned off.</summary>
+    public bool FullContentIndex { get; set; }
+
+    /// <summary>Most text kept per spreadsheet (they are mostly numbers; the start holds the headers).</summary>
+    public int MaxSpreadsheetChars { get; set; } = 300_000;
 
     /// <summary>Folders whose files are found by name only (their text is not read), e.g. program folders.</summary>
     public List<string> ExcludedContentPaths { get; set; } = new();
@@ -58,7 +66,9 @@ public sealed class Settings
     {
         if (!IndexContents) return false;
         var cat = CategoryOf(ext);
-        if (cat == ContentCategory.None || !ContentCategories.Contains(cat.ToString(), StringComparer.OrdinalIgnoreCase)) return false;
+        if (cat == ContentCategory.None) return false;
+        if (FullContentIndex) return true;
+        if (!ContentCategories.Contains(cat.ToString(), StringComparer.OrdinalIgnoreCase)) return false;
         return !IsExcludedContentPath(path);
     }
 
@@ -72,7 +82,7 @@ public sealed class Settings
         ".docx" or ".docm" or ".odt" => ContentCategory.Word,
         ".pptx" or ".odp" => ContentCategory.Presentation,
         ".txt" or ".md" or ".markdown" or ".rst" or ".tex" or ".srt" or ".ass" or ".vtt" => ContentCategory.Text,
-        ".xlsx" or ".xlsm" or ".ods" or ".csv" or ".tsv" => ContentCategory.Spreadsheet,
+        ".xlsx" or ".xlsm" or ".xls" or ".et" or ".ods" or ".csv" or ".tsv" => ContentCategory.Spreadsheet,
         ".html" or ".htm" => ContentCategory.Web,
         ".log" or ".ini" or ".cfg" or ".conf" or ".properties" => ContentCategory.Log,
         var e when Extraction.ContentExtractors.Default.CanExtract(e) => ContentCategory.Code,
@@ -193,6 +203,12 @@ public sealed class Settings
         {
             // 30 results hid long courseware that mentions a term only a few times.
             if (MaxResults == 30) MaxResults = 60;
+        }
+        if (SettingsVersion is >= 4 and < 5)
+        {
+            // 0.7.0: spreadsheet text is read again by default (with a per-file budget).
+            if (!ContentCategories.Contains(nameof(ContentCategory.Spreadsheet), StringComparer.OrdinalIgnoreCase))
+                ContentCategories.Add(nameof(ContentCategory.Spreadsheet));
         }
         if (SettingsVersion < 4)
         {

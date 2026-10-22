@@ -4,6 +4,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="ExcelDataReader" Version="3.7.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.13" />
     <PackageReference Include="PdfPig" Version="0.1.16" />
   </ItemGroup>

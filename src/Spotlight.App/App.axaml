@@ -17,6 +17,7 @@
           <SolidColorBrush x:Key="SelectionBrush" Color="#0A64D2" />
           <SolidColorBrush x:Key="HighlightBrush" Color="#33FFCC00" />
           <SolidColorBrush x:Key="PageHitBrush" Color="#66FFD400" />
+          <SolidColorBrush x:Key="BarBrush" Color="#FFFFFF" />
         </ResourceDictionary>
         <ResourceDictionary x:Key="Dark">
           <SolidColorBrush x:Key="PanelBrush" Color="#E62A2A2E" />
@@ -27,6 +28,7 @@
           <SolidColorBrush x:Key="SelectionBrush" Color="#0A64D2" />
           <SolidColorBrush x:Key="HighlightBrush" Color="#55FFCC00" />
           <SolidColorBrush x:Key="PageHitBrush" Color="#66FFD400" />
+          <SolidColorBrush x:Key="BarBrush" Color="#3A3A3E" />
         </ResourceDictionary>
       </ResourceDictionary.ThemeDictionaries>
     </ResourceDictionary>

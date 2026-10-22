@@ -29,7 +29,7 @@ public partial class SettingsWindow : Window
         (ContentCategory.Word, "Word 文稿"),
         (ContentCategory.Presentation, "PPT 演示文稿"),
         (ContentCategory.Text, "文本、Markdown"),
-        (ContentCategory.Spreadsheet, "表格（xlsx、csv）"),
+        (ContentCategory.Spreadsheet, "表格（xlsx、xls、csv、WPS）"),
         (ContentCategory.Web, "网页"),
         (ContentCategory.Code, "代码与数据（py、json、xml…）"),
         (ContentCategory.Log, "日志与配置（log、ini…）"),
@@ -89,6 +89,10 @@ public partial class SettingsWindow : Window
         foreach (var p in settings.ExcludedContentPaths) _noContent.Add(p);
         IndexFolderText.Text = settings.IndexFolder ?? Settings.AppDataDir;
         ContentsCheck.IsChecked = settings.IndexContents;
+        FullContentCheck.IsChecked = settings.FullContentIndex;
+        FullContentCheck.IsCheckedChanged += (_, _) => UpdateContentChoices();
+        ContentsCheck.IsCheckedChanged += (_, _) => UpdateContentChoices();
+        UpdateContentChoices();
         PdfLimit.Value = settings.MaxPdfFileSizeMB;
         DocLimit.Value = settings.MaxContentFileSizeMB;
         BatteryCheck.IsChecked = settings.PauseContentIndexingOnBattery;
@@ -134,6 +138,17 @@ public partial class SettingsWindow : Window
         return picked.Count > 0 ? picked[0].TryGetLocalPath() : null;
     }
 
+    // In full mode every kind and folder is read, so the narrower choices are shown greyed out
+    // (kept, not cleared: they apply again when full mode is turned off).
+    private void UpdateContentChoices()
+    {
+        bool contents = ContentsCheck.IsChecked == true;
+        bool narrow = contents && FullContentCheck.IsChecked != true;
+        FullContentCheck.IsEnabled = contents;
+        foreach (var (_, box) in _contentBoxes) box.IsEnabled = narrow;
+        NoContentList.IsEnabled = narrow;
+    }
+
     private static bool SafeAutostart()
     {
         try { return Platform.StartsWithWindows; } catch (Exception) { return false; }
@@ -161,6 +176,7 @@ public partial class SettingsWindow : Window
             .Split(new[] { ',', '，', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries)
             .Select(Settings.NormalizeExtension).Where(e => e.Length > 1).Distinct().ToList();
         _settings.IndexContents = ContentsCheck.IsChecked == true;
+        _settings.FullContentIndex = FullContentCheck.IsChecked == true;
         _settings.MaxPdfFileSizeMB = (int)(PdfLimit.Value ?? 300);
         _settings.MaxContentFileSizeMB = (int)(DocLimit.Value ?? 20);
         _settings.PauseContentIndexingOnBattery = BatteryCheck.IsChecked == true;

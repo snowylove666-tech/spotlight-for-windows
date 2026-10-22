@@ -115,7 +115,23 @@ public partial class SearchWindow : Window
         Results.SelectionChanged += (_, _) => UpdatePreview();
         Results.DoubleTapped += (_, _) => OpenSelected(reveal: false);
         AddHandler(KeyDownEvent, OnKeyDown, Avalonia.Interactivity.RoutingStrategies.Tunnel);
-        Deactivated += (_, _) => { if (IsVisible) HideSearch(); };
+        // A preview handler taking the keyboard focus is not the user leaving.
+        Deactivated += (_, _) =>
+        {
+            if (!IsVisible || (OperatingSystem.IsWindows() && PreviewHandlerHost.IsForeground(TopHandle))) return;
+            // Starting a previewer can bring its Office program forward for a moment; take the
+            // foreground back instead of treating that as the user leaving.
+            if (DateTime.UtcNow < _handlerStartedUntil)
+            {
+                Dispatcher.UIThread.Post(() => { Activate(); Platform.ForceForeground(TopHandle); Query.Focus(); });
+                return;
+            }
+            HideSearch();
+        };
+        PrevPage.Click += (_, _) => TurnPage(-1);
+        NextPage.Click += (_, _) => TurnPage(+1);
+        NextHit.Click += (_, _) => JumpToHit(+1);
+        PreviewScroll.AddHandler(PointerWheelChangedEvent, OnPreviewWheel, Avalonia.Interactivity.RoutingStrategies.Tunnel);
         Opened += (_, _) =>
         {
             // Windows 11 rounds the window and draws its edge; a second rounded border of our own on
@@ -282,31 +298,222 @@ public partial class SearchWindow : Window
 
     // ---------------------------------------------------------------- page preview
 
-    private void LoadPagePreview(ResultItem item)
+    private DateTime _handlerStartedUntil;
+
+    private IntPtr TopHandle => TryGetPlatformHandle()?.Handle ?? IntPtr.Zero;
+
+    private void LoadPagePreview(ResultItem item, int? page = null, bool allowHandler = true, bool atEnd = false)
     {
         _previewCts?.Cancel();
         if (_previewItem != item) ClearPreviewImage();
-        if (!PagePreview.CanPreview(item.Result)) return;
         var cts = _previewCts = new CancellationTokenSource();
         var r = item.Result;
+        if (r.Kind == FileKind.Calculator || PagePreview.IsCloudOnly(r.Path)) return;
         // Only content hits have words worth marking; a name match shows the first page.
         var terms = r.ContentMatch ? TextTokenizer.QueryTerms(_lastQuery) : new List<string>();
-        double width = Math.Max(200, PreviewScroll.Bounds.Width - PreviewScroll.Padding.Left - PreviewScroll.Padding.Right - 14);
+        if (allowHandler && UsesHandler(r)) { LoadHandler(item, cts); return; }
+        if (SheetPreview.CanPreview(r.Path)) { LoadSheet(item, terms, cts); return; }
+        if (r.Kind is FileKind.Text or FileKind.Code || System.IO.Path.GetExtension(r.Path).Equals(".csv", StringComparison.OrdinalIgnoreCase))
+        {
+            LoadText(item, terms, cts);
+            return;
+        }
+        if (!PagePreview.CanPreview(r)) return;
+        // Right after the results first appear the pane may not be laid out yet: use the window's width.
+        double pane = PreviewScroll.Bounds.Width > 100 ? PreviewScroll.Bounds.Width : Width - 341;
+        double width = Math.Max(200, pane - PreviewScroll.Padding.Left - PreviewScroll.Padding.Right - 14);
         double scale = RenderScaling > 0 ? RenderScaling : 1;
         int pixels = (int)(width * scale);
         _ = Task.Run(async () =>
         {
-            await Task.Delay(90, cts.Token); // arrowing through the list: render only where the user stops
-            var img = await PagePreview.RenderAsync(r, terms, pixels, cts.Token);
+            // Arrowing through the list: render only where the user stops. Page turns go straight on.
+            if (page == null) await Task.Delay(90, cts.Token);
+            var img = await PagePreview.RenderAsync(r, terms, pixels, cts.Token, page);
             Dispatcher.UIThread.Post(() =>
             {
                 if (cts.IsCancellationRequested || Results.SelectedItem != item || !IsVisible) { img?.Bitmap.Dispose(); return; }
-                ShowPreviewImage(item, img, width, scale);
+                ShowPreviewImage(item, img, width, scale, atEnd);
             });
         }, cts.Token);
     }
 
-    private void ShowPreviewImage(ResultItem item, PreviewImage? img, double width, double scale)
+    // ---------------------------------------------------------------- Office documents (preview handlers)
+
+    private static bool UsesHandler(SearchResult r) =>
+        OperatingSystem.IsWindows() && r.Kind is FileKind.Document or FileKind.Presentation
+        && PreviewHandlerHost.HandlerFor(r.Path) != null;
+
+    private void LoadHandler(ResultItem item, CancellationTokenSource cts)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        _previewItem = item;
+        PreviewScroll.IsVisible = false;
+        Handler.IsVisible = true;
+        HandlerCaption.IsVisible = true;
+        HandlerName.Text = item.Result.Name;
+        HandlerSnippet.Inlines = Highlight(item.Result.Snippet ?? item.Result.Path, _lastQuery);
+        // Office takes a moment to start; only load the document the user stops on.
+        Task.Delay(220, cts.Token).ContinueWith(_ => Dispatcher.UIThread.Post(async () =>
+        {
+            if (cts.IsCancellationRequested || Results.SelectedItem != item || !IsVisible) return;
+            _handlerStartedUntil = DateTime.UtcNow.AddSeconds(8);
+            bool shown = Handler.HasWindow && await Handler.LoadAsync(item.Result.Path);
+            // Office activates a hidden window of its own a moment after drawing.
+            _handlerStartedUntil = DateTime.UtcNow.AddSeconds(4);
+            if (cts.IsCancellationRequested || Results.SelectedItem != item) return;
+            // The handler usually takes the keyboard; typing must keep going to the search box.
+            PreviewHandlerHost.TakeFocusBack(TopHandle);
+            Query.Focus();
+            if (!shown)
+            {
+                ClearPreviewImage();
+                LoadPagePreview(item, allowHandler: false); // thumbnail instead
+            }
+        }), cts.Token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
+    }
+
+    // ---------------------------------------------------------------- spreadsheets
+
+    private void LoadSheet(ResultItem item, List<string> terms, CancellationTokenSource cts)
+    {
+        var path = item.Result.Path;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(80, cts.Token);
+            SheetView? sheet;
+            try { sheet = SheetPreview.Read(path, terms, cts.Token); }
+            catch (Exception e) when (e is not OperationCanceledException) { sheet = null; }
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (cts.IsCancellationRequested || Results.SelectedItem != item) return;
+                if (sheet == null || sheet.Rows.Count == 0 || sheet.ColumnCount == 0) { LoadText(item, terms, cts); return; }
+                _previewItem = item;
+                ShowSheet(sheet, terms);
+            });
+        }, cts.Token);
+    }
+
+    private void ShowSheet(SheetView sheet, List<string> terms)
+    {
+        SheetGrid.Children.Clear();
+        SheetGrid.RowDefinitions.Clear();
+        SheetGrid.ColumnDefinitions.Clear();
+        var line = new SolidColorBrush(Color.Parse("#E1E1E1"));
+        var headBrush = new SolidColorBrush(Color.Parse("#F3F3F3"));
+        var hitBrush = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "PageHitBrush") ?? Brushes.Yellow;
+        var text = new SolidColorBrush(Color.Parse("#1D1D1F"));
+        var dim = new SolidColorBrush(Color.Parse("#6E6E73"));
+        for (int c = 0; c <= sheet.ColumnCount; c++) SheetGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
+        for (int r = 0; r <= sheet.Rows.Count; r++) SheetGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+
+        void Cell(int row, int col, string value, IBrush? background, IBrush foreground, bool right = false)
+        {
+            var cell = new Border
+            {
+                Background = background,
+                BorderBrush = line,
+                BorderThickness = new Thickness(0, 0, 1, 1),
+                Padding = new Thickness(6, 2),
+                MaxWidth = 160,
+                Child = new TextBlock
+                {
+                    Text = value, FontSize = 11, Foreground = foreground, TextTrimming = TextTrimming.CharacterEllipsis,
+                    HorizontalAlignment = right ? Avalonia.Layout.HorizontalAlignment.Right : Avalonia.Layout.HorizontalAlignment.Left,
+                },
+            };
+            Grid.SetRow(cell, row);
+            Grid.SetColumn(cell, col);
+            SheetGrid.Children.Add(cell);
+        }
+
+        Cell(0, 0, "", headBrush, dim);
+        for (int c = 0; c < sheet.ColumnCount; c++) Cell(0, c + 1, SheetPreview.ColumnName(c), headBrush, dim);
+        for (int r = 0; r < sheet.Rows.Count; r++)
+        {
+            Cell(r + 1, 0, sheet.RowNumbers[r].ToString(), headBrush, dim, right: true);
+            for (int c = 0; c < sheet.ColumnCount; c++)
+            {
+                var v = sheet.Rows[r][c];
+                bool hit = v.Length > 0 && terms.Any(t => v.Contains(t, StringComparison.OrdinalIgnoreCase));
+                bool number = v.Length > 0 && double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _);
+                Cell(r + 1, c + 1, v, hit ? hitBrush : Brushes.White, text, number);
+            }
+        }
+        SheetLabel.Text = sheet.SheetCount > 1 ? $"工作表「{sheet.SheetName}」（共 {sheet.SheetCount} 个）" : $"工作表「{sheet.SheetName}」";
+        SheetFrame.IsVisible = true;
+        IconPanel.IsVisible = false;
+    }
+
+    // ---------------------------------------------------------------- text files
+
+    private void LoadText(ResultItem item, List<string> terms, CancellationTokenSource cts)
+    {
+        var path = item.Result.Path;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(60, cts.Token);
+            string? text;
+            try { text = PagePreview.TextAround(path, terms, cts.Token); }
+            catch (Exception e) when (e is not OperationCanceledException) { text = null; }
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (cts.IsCancellationRequested || Results.SelectedItem != item || string.IsNullOrEmpty(text)) return;
+                _previewItem = item;
+                PreviewText.Inlines = Highlight(text, _lastQuery);
+                TextFrame.IsVisible = true;
+                // The snippet repeats what the text view shows.
+                PreviewSnippet.IsVisible = false;
+            });
+        }, cts.Token);
+    }
+
+    // ---------------------------------------------------------------- page turning
+
+    private DateTime _lastWheelTurn;
+
+    private void TurnPage(int step, bool atEnd = false)
+    {
+        if (_preview is not { Page: { } page, PageCount: { } count } || _previewItem is not { } item) return;
+        int target = page + step;
+        if (target < 1 || target > count || Results.SelectedItem != item) return;
+        LoadPagePreview(item, target, atEnd: atEnd);
+    }
+
+    private void JumpToHit(int step)
+    {
+        if (_preview is not { Page: { } page } || _previewItem is not { } item || !item.Result.ContentMatch) return;
+        var terms = TextTokenizer.QueryTerms(_lastQuery);
+        var path = item.Result.Path;
+        PageLabel.Text = "正在查找…";
+        _ = Task.Run(() =>
+        {
+            int? next;
+            try { next = PagePreview.FindHitPage(path, page, step, terms, CancellationToken.None); }
+            catch (Exception) { next = null; }
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (Results.SelectedItem != item || _previewItem != item) return;
+                if (next is { } p) LoadPagePreview(item, p);
+                else if (_preview is { } img) PageLabel.Text = $"第 {img.Page} 页，共 {img.PageCount} 页 · {(step > 0 ? "后面" : "前面")}没有更多命中";
+            });
+        });
+    }
+
+    /// <summary>Wheel past the bottom of the page: next page; past the top: previous one.</summary>
+    private void OnPreviewWheel(object? sender, PointerWheelEventArgs e)
+    {
+        if (!PageFrame.IsVisible || _preview?.Page == null) return;
+        double max = PreviewScroll.Extent.Height - PreviewScroll.Viewport.Height;
+        bool down = e.Delta.Y < 0;
+        bool atEdge = down ? PreviewScroll.Offset.Y >= max - 1 : PreviewScroll.Offset.Y <= 1;
+        if (!atEdge) return;
+        e.Handled = true;
+        if (DateTime.UtcNow - _lastWheelTurn < TimeSpan.FromMilliseconds(450)) return;
+        _lastWheelTurn = DateTime.UtcNow;
+        TurnPage(down ? +1 : -1, atEnd: !down);
+    }
+
+    private void ShowPreviewImage(ResultItem item, PreviewImage? img, double width, double scale, bool atEnd = false)
     {
         ClearPreviewImage();
         if (img == null) return;
@@ -330,13 +537,19 @@ public partial class SearchWindow : Window
         PageFrame.IsVisible = true;
         IconPanel.IsVisible = false;
         PageLabel.Text = img.Page is { } p ? $"第 {p} 页，共 {img.PageCount} 页" : "";
-        PageLabel.IsVisible = img.Page != null;
-        if (img.Highlights.Count > 0)
+        PageNav.IsVisible = img.Page != null;
+        PrevPage.IsEnabled = img.Page > 1;
+        NextPage.IsEnabled = img.Page < img.PageCount;
+        NextHit.IsVisible = item.Result.ContentMatch;
+        if (atEnd)
+            Dispatcher.UIThread.Post(() => PreviewScroll.Offset = new Vector(0, PreviewScroll.Extent.Height), DispatcherPriority.Background);
+        else if (img.Highlights.Count > 0)
         {
             // Bring the first hit into view, a little below the top edge.
             double y = img.Highlights.Min(b => b.Y) * h;
             Dispatcher.UIThread.Post(() => PreviewScroll.Offset = new Vector(0, Math.Max(0, PageFrame.Bounds.Y + y - 60)), DispatcherPriority.Background);
         }
+        else Dispatcher.UIThread.Post(() => PreviewScroll.Offset = default, DispatcherPriority.Background);
     }
 
     private void ClearPreviewImage()
@@ -344,8 +557,16 @@ public partial class SearchWindow : Window
         HitLayer.Children.Clear();
         PageImage.Source = null;
         PageFrame.IsVisible = false;
-        PageLabel.IsVisible = false;
+        PageNav.IsVisible = false;
+        TextFrame.IsVisible = false;
+        PreviewText.Inlines = null;
+        SheetFrame.IsVisible = false;
+        SheetGrid.Children.Clear();
         IconPanel.IsVisible = true;
+        if (OperatingSystem.IsWindows()) Handler.Unload();
+        Handler.IsVisible = false;
+        HandlerCaption.IsVisible = false;
+        PreviewScroll.IsVisible = true;
         _preview?.Bitmap.Dispose();
         _preview = null;
         _previewItem = null;
@@ -399,6 +620,12 @@ public partial class SearchWindow : Window
                 Move(-8); e.Handled = true; break;
             case Key.Enter:
                 OpenSelected(reveal: ctrl); e.Handled = true; break;
+            case Key.Right when ctrl && PageNav.IsVisible:
+                TurnPage(+1); e.Handled = true; break;
+            case Key.Left when ctrl && PageNav.IsVisible:
+                TurnPage(-1); e.Handled = true; break;
+            case Key.F3 when PageNav.IsVisible:
+                JumpToHit(e.KeyModifiers.HasFlag(KeyModifiers.Shift) ? -1 : +1); e.Handled = true; break;
             case Key.C when ctrl && e.KeyModifiers.HasFlag(KeyModifiers.Shift):
                 if (Results.SelectedItem is ResultItem it) _ = Clipboard?.SetTextAsync(it.Result.Kind == FileKind.Calculator ? it.Result.Value : it.Result.Path);
                 e.Handled = true;
@@ -427,10 +654,10 @@ public partial class SearchWindow : Window
         try
         {
             if (reveal) Platform.Reveal(r.Path);
-            else if (r.ContentMatch)
+            else if (r.ContentMatch || (_previewItem == item && _preview?.Page > 1))
             {
-                // Open at the hit: the page from the index, or the one the preview found.
-                int? page = r.Page ?? (_previewItem == item ? _preview?.Page : null);
+                // Open at the page on screen (the hit, or where the user turned to), else the indexed one.
+                int? page = (_previewItem == item ? _preview?.Page : null) ?? r.Page;
                 var term = TextTokenizer.QueryTerms(_lastQuery).OrderByDescending(t => t.Length).FirstOrDefault();
                 Platform.OpenAt(r.Path, page, term);
             }

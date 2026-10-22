@@ -124,7 +124,8 @@
         <Border Grid.Row="1" Grid.Column="1" Background="{DynamicResource DividerBrush}" />
 
         <!-- Preview of the selected item -->
-        <ScrollViewer x:Name="PreviewScroll" Grid.Row="1" Grid.Column="2" Padding="20,16" HorizontalScrollBarVisibility="Disabled">
+        <Grid Grid.Row="1" Grid.Column="2" RowDefinitions="*,Auto">
+        <ScrollViewer x:Name="PreviewScroll" Grid.RowSpan="2" Padding="20,16" HorizontalScrollBarVisibility="Disabled">
           <StackPanel x:Name="Preview" Spacing="10">
             <!-- The page / picture itself, with the matched words marked, when the file has one. -->
             <Border x:Name="PageFrame" IsVisible="False" HorizontalAlignment="Center" Background="White"
@@ -134,8 +135,21 @@
                 <Canvas x:Name="HitLayer" />
               </Panel>
             </Border>
-            <TextBlock x:Name="PageLabel" IsVisible="False" FontSize="11" HorizontalAlignment="Center"
-                       Foreground="{DynamicResource TextSecondary}" />
+            <!-- Spreadsheets: the cells around the first hit, as a grid. -->
+            <StackPanel x:Name="SheetFrame" IsVisible="False" Spacing="6">
+              <TextBlock x:Name="SheetLabel" FontSize="11" HorizontalAlignment="Center" Foreground="{DynamicResource TextSecondary}" />
+              <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+                <Border Background="White" BorderBrush="#D0D0D0" BorderThickness="1" HorizontalAlignment="Left">
+                  <Grid x:Name="SheetGrid" />
+                </Border>
+              </ScrollViewer>
+            </StackPanel>
+            <!-- Text and code files: the text itself around the first hit. -->
+            <Border x:Name="TextFrame" IsVisible="False" CornerRadius="6" Padding="12,10" Background="{DynamicResource DividerBrush}">
+              <SelectableTextBlock x:Name="PreviewText" FontSize="12" TextWrapping="Wrap" LineHeight="19"
+                                   FontFamily="Cascadia Mono, Consolas, Microsoft YaHei UI, monospace"
+                                   Foreground="{DynamicResource TextPrimary}" />
+            </Border>
             <Panel x:Name="IconPanel" HorizontalAlignment="Center" Height="72" Margin="0,8,0,0">
               <Image x:Name="PreviewIcon" Width="64" Height="64" />
               <TextBlock x:Name="PreviewGlyph" FontSize="52" HorizontalAlignment="Center" VerticalAlignment="Center" />
@@ -151,6 +165,27 @@
                                  Foreground="{DynamicResource TextSecondary}" />
           </StackPanel>
         </ScrollViewer>
+        <!-- Word, Excel, PowerPoint…: drawn by the preview handler Explorer uses. -->
+        <local:PreviewHandlerHost x:Name="Handler" IsVisible="False" Margin="10,10,10,6" />
+        <!-- Page turning for PDFs: buttons, Ctrl+←/→, F3, or the mouse wheel past the page edge.
+             Kept below the scrolling page so it is always at hand. -->
+        <Border x:Name="PageNav" Grid.Row="1" IsVisible="False" HorizontalAlignment="Center" Margin="0,0,0,8"
+                Padding="4,2" CornerRadius="14" Background="{DynamicResource BarBrush}" BoxShadow="0 1 6 0 #40000000">
+          <StackPanel Orientation="Horizontal" Spacing="2">
+            <Button x:Name="PrevPage" Classes="chip" Content="‹ 上一页" ToolTip.Tip="Ctrl+←" />
+            <TextBlock x:Name="PageLabel" FontSize="11" VerticalAlignment="Center" Margin="6,0"
+                       Foreground="{DynamicResource TextSecondary}" />
+            <Button x:Name="NextPage" Classes="chip" Content="下一页 ›" ToolTip.Tip="Ctrl+→" />
+            <Button x:Name="NextHit" Classes="chip" Content="下一处命中 ↓" ToolTip.Tip="F3（Shift+F3 上一处）" />
+          </StackPanel>
+        </Border>
+        <StackPanel x:Name="HandlerCaption" Grid.Row="1" IsVisible="False" Margin="14,0,14,10" Spacing="2">
+          <TextBlock x:Name="HandlerName" FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"
+                     Foreground="{DynamicResource TextPrimary}" />
+          <SelectableTextBlock x:Name="HandlerSnippet" FontSize="12" TextWrapping="Wrap" MaxLines="2"
+                               Foreground="{DynamicResource TextSecondary}" />
+        </StackPanel>
+        </Grid>
       </Grid>
 
       <!-- Footer -->
@@ -158,7 +193,7 @@
         <Grid ColumnDefinitions="*,Auto">
           <TextBlock x:Name="Status" FontSize="11" Foreground="{DynamicResource TextSecondary}" TextTrimming="CharacterEllipsis" />
           <TextBlock Grid.Column="1" FontSize="11" Foreground="{DynamicResource TextSecondary}"
-                     Text="↵ 打开   Ctrl+↵ 打开位置   Tab 切换类型   Ctrl+Shift+C 复制路径   Esc 关闭" />
+                     Text="↵ 打开   Ctrl+↵ 打开位置   Tab 切换类型   Ctrl+←/→ 翻页   F3 下一处   Esc 关闭" />
         </Grid>
       </Border>
     </StackPanel>

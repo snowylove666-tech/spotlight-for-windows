@@ -59,6 +59,7 @@ public sealed class Indexer : IDisposable
         _store = store;
         _settings = settings;
         _excludedNames = new HashSet<string>(settings.ExcludedDirNames, StringComparer.OrdinalIgnoreCase);
+        _ownFiles = Path.GetFullPath(store.DbPath);
         Roots = roots ?? Settings.AppRoots().Concat(settings.EffectiveRoots()).ToList();
     }
 
@@ -113,20 +114,24 @@ public sealed class Indexer : IDisposable
         var ct = _cts.Token;
         try
         {
-            DropUnwantedText();
             // Watch first: files created or deleted while the (possibly long) first crawl runs are
-            // queued and applied right after it, instead of waiting for the next full scan.
+            // applied during it (see ApplyFileChanges), instead of waiting for the next full scan.
             StartWatchers();
-            FullScan(ct);
+            Guarded(() => { DropUnwantedText(); FullScan(ct); });
             while (!ct.IsCancellationRequested)
             {
-                if (_fullRescanRequested) { _fullRescanRequested = false; FullScan(ct); }
-                while (_rescanRoots.TryDequeue(out var root)) ScanRoot(root, _store.NextGeneration(), ct);
-                ApplyChanges(ct);
-                bool moreContent = ReadContents(ct);
-                Publish(IndexPhase.Idle);
-                _store.ReleaseMemory();
-                Idle?.Invoke();
+                bool moreContent = true;
+                Guarded(() =>
+                {
+                    if (_fullRescanRequested) { _fullRescanRequested = false; FullScan(ct); }
+                    ApplyChanges(ct);
+                    while (_rescanRoots.TryDequeue(out var root)) ScanRoot(root, _store.NextGeneration(), ct);
+                    ApplyChanges(ct);
+                    moreContent = ReadContents(ct);
+                    Publish(IndexPhase.Idle);
+                    _store.ReleaseMemory();
+                    Idle?.Invoke();
+                });
                 // With content left to read (but paused on battery) re-check power once a minute.
                 _wake.WaitOne(moreContent ? TimeSpan.FromSeconds(60) : Timeout.InfiniteTimeSpan);
                 if (!_changes.IsEmpty) Thread.Sleep(Debounce);
@@ -134,6 +139,21 @@ public sealed class Indexer : IDisposable
         }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+    }
+
+    /// <summary>Runs one step of the loop. An unexpected error (a locked database, a driver returning
+    /// garbage) is logged and the loop goes on: before, it ended the indexer thread for good and the
+    /// index silently stopped following the disk.</summary>
+    private void Guarded(Action step)
+    {
+        try { step(); }
+        catch (OperationCanceledException) { throw; }
+        catch (ObjectDisposedException) { throw; }
+        catch (Exception e)
+        {
+            ErrorLog.Write("indexer", e);
+            Thread.Sleep(TimeSpan.FromSeconds(5));
+        }
     }
 
     /// <summary>Runs one full crawl and the content pass synchronously. Used by the CLI and tests.</summary>
@@ -148,6 +168,9 @@ public sealed class Indexer : IDisposable
     /// <summary>File types or folders switched to name-only: drop their text and give the space back.</summary>
     private void DropUnwantedText()
     {
+        // Older versions indexed the index itself (see _ownFiles).
+        foreach (var suffix in new[] { "", "-wal", "-shm", "-journal", ".moving" }) _store.DeletePath(_ownFiles + suffix);
+        _store.ReclassifyExecutables();
         int dropped = _store.PurgeIneligibleContent();
         if (dropped == 0) return;
         if (dropped > 500) _store.Optimize();
@@ -192,12 +215,14 @@ public sealed class Indexer : IDisposable
                         // Don't follow junctions/symlinks: they create loops and duplicate trees.
                         if (!IsLink(d)) stack.Push(d);
                     }
-                    else if (_settings.IsExcludedFile(e.Extension)) continue;
+                    else if (_settings.IsExcludedFile(e.Extension) || IsExcludedPath(e.FullName)) continue;
                     _store.Upsert(e, gen);
                     if (++inBatch >= 2000)
                     {
                         _store.CommitBatch();
                         inBatch = 0;
+                        // A crawl of a whole drive takes minutes: don't make new files wait for it.
+                        ApplyFileChanges(ct);
                         if (sw.ElapsedMilliseconds > 1000) { Publish(IndexPhase.Scanning, root); sw.Restart(); }
                         _store.BeginBatch();
                     }
@@ -238,7 +263,13 @@ public sealed class Indexer : IDisposable
         AttributesToSkip = _settings.IndexHiddenFiles ? FileAttributes.System : FileAttributes.System | FileAttributes.Hidden,
     };
 
+    // The index (e.g. D:\SpotlightWinData\index.db, -wal, -shm) sits inside a watched drive. Indexing
+    // it made every write to the index raise a change event that woke the indexer to write again,
+    // which kept it too busy to pick up new files.
+    private readonly string _ownFiles;
+
     private bool IsExcludedPath(string path) =>
+        path.StartsWith(_ownFiles, StringComparison.OrdinalIgnoreCase) ||
         _settings.ExcludedPaths.Any(p => path.StartsWith(Path.TrimEndingDirectorySeparator(p), StringComparison.OrdinalIgnoreCase));
 
     private bool IsExcluded(string path)
@@ -289,12 +320,17 @@ public sealed class Indexer : IDisposable
         _wake.Set();
     }
 
-    private void ApplyChanges(CancellationToken ct)
+    /// <summary>Applies queued changes to single files (not folders, whose subtree may be large).
+    /// Called in the middle of crawls and content batches so new files show up within seconds.</summary>
+    private void ApplyFileChanges(CancellationToken ct) => ApplyChanges(ct, filesOnly: true);
+
+    private void ApplyChanges(CancellationToken ct, bool filesOnly = false)
     {
         if (_changes.IsEmpty) return;
         var paths = _changes.Keys.ToList();
         foreach (var p in paths) _changes.TryRemove(p, out _);
         var options = EnumOptions();
+        int urgent = 0;
         foreach (var path in paths)
         {
             ct.ThrowIfCancellationRequested();
@@ -302,6 +338,7 @@ public sealed class Indexer : IDisposable
             {
                 if (Directory.Exists(path))
                 {
+                    if (filesOnly) { _changes[path] = 0; continue; }
                     // New or moved-in folder: index its whole subtree.
                     ScanRoot(path, _store.NextGeneration(), ct);
                 }
@@ -313,6 +350,13 @@ public sealed class Indexer : IDisposable
                     _store.BeginBatch();
                     try { _store.Upsert(fi, _store.NextGeneration()); }
                     finally { _store.CommitBatch(); }
+                    // A file just saved or downloaded is likely what the user searches for next:
+                    // read it ahead of the backlog (a few hundred at most, e.g. when a folder is pasted).
+                    if (urgent < 200 && _store.Find(path) is { WantsContent: true, ContentRead: false } rec)
+                    {
+                        _urgent.Enqueue(rec.Id);
+                        urgent++;
+                    }
                 }
                 else _store.DeletePath(path);
             }
@@ -354,7 +398,7 @@ public sealed class Indexer : IDisposable
             var results = new (long, long, string?, string?)[batch.Count];
             if (workers == 1)
             {
-                for (int i = 0; i < batch.Count; i++)
+                for (int i = 0; i < batch.Count && !ChangesWaiting; i++)
                 {
                     var text = ExtractSafely(batch[i], ct, out var note);
                     results[i] = (batch[i].Id, batch[i].MTime, text, note);
@@ -362,18 +406,23 @@ public sealed class Indexer : IDisposable
             }
             else
             {
-                Parallel.For(0, batch.Count, new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = ct }, i =>
+                Parallel.For(0, batch.Count, new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = ct }, (i, loop) =>
                 {
+                    // A file was created or a document asked for: stop starting new documents.
+                    if (ChangesWaiting) { loop.Stop(); return; }
                     var text = ExtractSafely(batch[i], ct, out var note);
                     results[i] = (batch[i].Id, batch[i].MTime, text, note);
                 });
             }
             ct.ThrowIfCancellationRequested();
-            _store.SetContents(results);
-            _rate.Add(batch.Count);
+            var done = results.Where(r => r.Item1 != 0).ToList();
+            _store.SetContents(done);
+            _rate.Add(done.Count);
         }
         return true;
     }
+
+    private bool ChangesWaiting => !_changes.IsEmpty || !_urgent.IsEmpty;
 
     /// <summary>True while documents are being read with several workers.</summary>
     public bool FastMode { get; private set; }
@@ -428,7 +477,9 @@ public sealed class Indexer : IDisposable
         {
             var text = extractor is PdfExtractor pdf
                 ? pdf.ExtractWithNote(item.Path, _settings.MaxContentChars, timeout.Token, out note)
-                : extractor.Extract(item.Path, _settings.MaxContentChars, timeout.Token);
+                : extractor.Extract(item.Path, MaxChars(item.Ext), timeout.Token);
+            if (text != null && Settings.CategoryOf(item.Ext) == ContentCategory.Spreadsheet && text.Length >= MaxChars(item.Ext))
+                note = $"表格文字较多，只读取了前 {MaxChars(item.Ext):N0} 个字符";
             // Shutting down: don't record a half-read document as done.
             ct.ThrowIfCancellationRequested();
             if (string.IsNullOrWhiteSpace(text) && note == null)
@@ -438,6 +489,11 @@ public sealed class Indexer : IDisposable
         catch (OperationCanceledException) when (!ct.IsCancellationRequested) { note = "读取超时"; return null; }
         catch (Exception e) when (e is not OperationCanceledException) { note = "读取失败：" + e.Message; return null; }
     }
+
+    /// <summary>Spreadsheets get a smaller text budget than prose: a big data sheet would otherwise
+    /// cost megabytes of index for numbers nobody searches for.</summary>
+    private int MaxChars(string ext) =>
+        Settings.CategoryOf(ext) == ContentCategory.Spreadsheet && !_settings.FullContentIndex ? Math.Min(_settings.MaxContentChars, _settings.MaxSpreadsheetChars) : _settings.MaxContentChars;
 
     // ---------------------------------------------------------------- diagnostics
 
