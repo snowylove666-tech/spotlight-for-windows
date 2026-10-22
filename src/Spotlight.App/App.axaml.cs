@@ -87,6 +87,7 @@ public partial class App : Application
             _store = new IndexStore(dbPath, _settings);
         }
         _engine = new SearchEngine(dbPath);
+        Platform.RememberIndexFolder(Path.GetDirectoryName(_settings.IndexDbPath)!);
 
         _window = new SearchWindow(_engine, _store, _settings);
         _window.HiddenAway += ScheduleTrim;
@@ -155,6 +156,7 @@ public partial class App : Application
         }
         _store = new IndexStore(_settings.IndexDbPath, _settings);
         _engine = new SearchEngine(_settings.IndexDbPath);
+        Platform.RememberIndexFolder(Path.GetDirectoryName(_settings.IndexDbPath)!);
         _window.Rebind(_engine, _store);
         StartIndexer();
     }
@@ -234,16 +236,20 @@ public partial class App : Application
             try { Platform.StartsWithWindows = !SafeStartsWithWindows(); } catch (Exception) { }
             _autostartItem.IsChecked = SafeStartsWithWindows();
         };
-        var check = new NativeMenuItem("检查某个文件为什么搜不到…");
-        check.Click += async (_, _) => await CheckFileAsync();
         var quit = new NativeMenuItem("退出");
-        quit.Click += (_, _) => Quit();
+        quit.Click += (_, _) =>
+        {
+            // People could not find the way back after quitting a tray app.
+            if (Platform.Confirm("退出聚焦搜索",
+                    "退出后 Alt+Space 将不再响应。\n\n以后可以从「开始」菜单或桌面上的「聚焦搜索」图标重新打开。\n\n确定退出吗？"))
+                Quit();
+        };
 
         _tray = new TrayIcon
         {
             Icon = new WindowIcon(iconStream),
             ToolTipText = "聚焦搜索",
-            Menu = new NativeMenu { _showItem, new NativeMenuItemSeparator(), settings, _autostartItem, rescan, check, new NativeMenuItemSeparator(), quit },
+            Menu = new NativeMenu { _showItem, new NativeMenuItemSeparator(), settings, _autostartItem, rescan, new NativeMenuItemSeparator(), quit },
         };
         _tray.Clicked += (_, _) => _window.ShowSearch();
         TrayIcon.SetIcons(this, new TrayIcons { _tray });
@@ -254,6 +260,7 @@ public partial class App : Application
         if (_settingsWindow != null) { _settingsWindow.Activate(); return; }
         _settingsWindow = new SettingsWindow(_settings);
         _settingsWindow.IndexFolderChosen += folder => _ = MoveIndexTo(folder);
+        _settingsWindow.UninstallRequested += Uninstall;
         _settingsWindow.Saved += () =>
         {
             if (_autostartItem != null) _autostartItem.IsChecked = SafeStartsWithWindows();
@@ -268,16 +275,42 @@ public partial class App : Application
         _settingsWindow.Activate();
     }
 
-    private async Task CheckFileAsync()
+    /// <summary>
+    /// Removes the app. An installed copy runs its uninstaller (which also deletes the index and
+    /// settings). A portable copy removes the autostart entry, the index and the settings itself,
+    /// and the exe deletes itself once the process has exited.
+    /// </summary>
+    private void Uninstall()
     {
-        var files = await _window.StorageProvider.OpenFilePickerAsync(new Avalonia.Platform.Storage.FilePickerOpenOptions
+        var exe = Environment.ProcessPath;
+        var dir = exe == null ? null : Path.GetDirectoryName(exe);
+        var uninstaller = dir == null ? null : Directory.GetFiles(dir, "unins*.exe").FirstOrDefault();
+        if (uninstaller != null)
         {
-            Title = "选择要检查的文件",
-            AllowMultiple = false,
-        });
-        var path = files.Count > 0 ? files[0].TryGetLocalPath() : null;
-        _window.ShowSearch();
-        if (path != null) _window.SetNotice(_indexer.Diagnose(path), sticky: false);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uninstaller) { UseShellExecute = true });
+            Quit();
+            return;
+        }
+        if (!Platform.Confirm("卸载聚焦搜索",
+                "将删除：\n· 开机自动启动\n· 索引文件（" + _store.DbPath + "）\n· 设置（" + Settings.AppDataDir + "）\n· 程序本身（" + exe + "）\n\n你的文档不会受影响。确定卸载吗？"))
+            return;
+        var db = _store.DbPath;
+        try { Platform.StartsWithWindows = false; } catch (Exception) { }
+        Cleanup();
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        foreach (var f in new[] { db, db + "-wal", db + "-shm", db + ".moving" })
+            try { File.Delete(f); } catch (Exception) { }
+        try { var folder = Path.GetDirectoryName(db); if (folder != null && !Directory.EnumerateFileSystemEntries(folder).Any()) Directory.Delete(folder); } catch (Exception) { }
+        try { Directory.Delete(Settings.AppDataDir, recursive: true); } catch (Exception) { }
+        if (OperatingSystem.IsWindows())
+            try { Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(@"Software\SpotlightWin", throwOnMissingSubKey: false); } catch (Exception) { }
+        if (exe != null)
+        {
+            // The running exe cannot delete itself: a hidden cmd does it a moment after we exit.
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe",
+                $"/c ping 127.0.0.1 -n 3 > nul & del /f /q \"{exe}\"") { CreateNoWindow = true, UseShellExecute = false });
+        }
+        (ApplicationLifetime as IClassicDesktopStyleApplicationLifetime)?.Shutdown();
     }
 
     private void Quit()

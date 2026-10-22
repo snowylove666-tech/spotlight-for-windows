@@ -23,6 +23,14 @@
     <SelfContained>true</SelfContained>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <!-- Drop the unused parts of .NET (57 MB → about 25 MB). Partial: only libraries that declare
+         themselves trimmable are trimmed, so Avalonia's XAML and our reflection keep working. -->
+    <PublishTrimmed>true</PublishTrimmed>
+    <TrimMode>partial</TrimMode>
+    <SuppressTrimAnalysisWarnings>true</SuppressTrimAnalysisWarnings>
+    <!-- Preview handlers and shell thumbnails are classic COM; settings.json uses reflection. -->
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
   </PropertyGroup>
   <ItemGroup>
     <!-- Prefer a smaller heap over GC throughput: the app is idle almost all the time. -->
@@ -36,6 +44,8 @@
     <PackageReference Include="Avalonia.Desktop" Version="11.3.22" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.22" />
     <PackageReference Include="System.Drawing.Common" Version="10.0.13" />
+    <!-- GPU rendering (ANGLE, 5 MB) is never used: the window renders in software (Program.cs). -->
+    <PackageReference Include="Avalonia.Angle.Windows.Natives" Version="2.1.25547.20250602" ExcludeAssets="all" PrivateAssets="all" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Spotlight.Core\Spotlight.Core.csproj" />

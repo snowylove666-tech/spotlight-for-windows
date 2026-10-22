@@ -91,7 +91,21 @@ public sealed class Release070Tests : IDisposable
         var s = Settings.Load(path);
         Assert.Equal(new[] { "Pdf", "Word", "Spreadsheet" }, s.ContentCategories);
         Assert.False(s.FullContentIndex);
-        Assert.Contains("\"SettingsVersion\": 5", File.ReadAllText(path));
+        Assert.Contains("\"SettingsVersion\": 6", File.ReadAllText(path));
+    }
+
+    [Fact]
+    public void OwnFoldersOnTheSystemDriveAreSearchedButNotSystemFolders()
+    {
+        Directory.CreateDirectory(Path.Combine(_dir, "home", "工作"));
+        Directory.CreateDirectory(Path.Combine(_dir, "home", "AppData"));
+        Directory.CreateDirectory(Path.Combine(_dir, "home", ".vscode"));
+        var folders = new Settings().SystemDriveFolders(Path.Combine(_dir, "home")).ToList();
+        if (!OperatingSystem.IsWindows()) { Assert.Empty(folders); return; }
+        Assert.Contains(Path.Combine(_dir, "home", "工作"), folders);
+        Assert.DoesNotContain(folders, f => f.EndsWith("AppData") || f.EndsWith(".vscode"));
+        Assert.DoesNotContain(folders, f => f.EndsWith(@"\Windows", StringComparison.OrdinalIgnoreCase)
+            || f.Contains("Program Files", StringComparison.OrdinalIgnoreCase) || f.EndsWith("ProgramData"));
     }
 
     [Fact]

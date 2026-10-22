@@ -50,6 +50,9 @@ public partial class SettingsWindow : Window
     /// <summary>Raised after the settings were saved; the caller re-registers the hotkey and re-indexes.</summary>
     public event Action? Saved;
 
+    /// <summary>The user asked to remove the app (the app confirms and does it).</summary>
+    public event Action? UninstallRequested;
+
     public SettingsWindow() : this(new Settings()) { }
 
     public SettingsWindow(Settings settings)
@@ -99,6 +102,7 @@ public partial class SettingsWindow : Window
         FastCheck.IsChecked = settings.FastIndexingWhenPluggedIn;
         HiddenCheck.IsChecked = settings.IndexHiddenFiles;
         AutostartCheck.IsChecked = SafeAutostart();
+        UninstallButton.Click += (_, _) => { Close(); UninstallRequested?.Invoke(); };
 
         AddRoot.Click += async (_, _) => { if (await PickFolder("选择要搜索的文件夹或磁盘") is { } p) { AddUnique(_roots, p); _usingDefaultRoots = false; UpdateRootsHint(); } };
         RemoveRoot.Click += (_, _) => { if (RootsList.SelectedItem is string s) { _roots.Remove(s); _usingDefaultRoots = false; UpdateRootsHint(); } };

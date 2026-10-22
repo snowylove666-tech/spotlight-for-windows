@@ -38,6 +38,10 @@
       <StackPanel>
         <TextBlock Classes="h" Text="启动" />
         <CheckBox x:Name="AutostartCheck" Content="开机自动启动（在后台运行，不弹出窗口）" />
+        <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,8,0,0">
+          <Button x:Name="UninstallButton" Content="卸载聚焦搜索…" />
+          <TextBlock Classes="hint" VerticalAlignment="Center" Text="同时删除索引文件和设置，你的文档不受影响。" />
+        </StackPanel>
         <TextBlock Classes="hint" Text="也可以在托盘图标的右键菜单里随时打开或关闭。" Margin="0,2,0,0" />
 
         <TextBlock Classes="h" Text="快捷键" />

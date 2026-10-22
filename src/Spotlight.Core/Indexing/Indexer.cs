@@ -125,7 +125,7 @@ public sealed class Indexer : IDisposable
                 {
                     if (_fullRescanRequested) { _fullRescanRequested = false; FullScan(ct); }
                     ApplyChanges(ct);
-                    while (_rescanRoots.TryDequeue(out var root)) ScanRoot(root, _store.NextGeneration(), ct);
+                    while (_rescanRoots.TryDequeue(out var root)) Rescan(root, ct);
                     ApplyChanges(ct);
                     moreContent = ReadContents(ct);
                     Publish(IndexPhase.Idle);
@@ -183,6 +183,17 @@ public sealed class Indexer : IDisposable
         foreach (var root in Roots) ScanRoot(root, gen, ct);
         // Anything not seen by this crawl is gone, outside the configured locations, or now filtered out.
         _store.DeleteOlderThan(gen);
+    }
+
+    /// <summary>Crawls one root again (its watcher lost events). Roots nested in it (e.g. the Start
+    /// Menu under C:\) are crawled in the same generation, so its stale-row sweep keeps them.</summary>
+    private void Rescan(string root, CancellationToken ct)
+    {
+        long gen = _store.NextGeneration();
+        foreach (var nested in Roots.Where(r => !r.Equals(root, StringComparison.OrdinalIgnoreCase)
+                     && r.StartsWith(Settings.WithSeparator(root), StringComparison.OrdinalIgnoreCase)))
+            ScanRoot(nested, gen, ct);
+        ScanRoot(root, gen, ct);
     }
 
     // ---------------------------------------------------------------- crawling

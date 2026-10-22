@@ -5,7 +5,7 @@ namespace Spotlight.Core;
 
 public sealed class Settings
 {
-    public const int CurrentVersion = 5;
+    public const int CurrentVersion = 6;
 
     /// <summary>Format version of this file; older files are upgraded on load.</summary>
     public int SettingsVersion { get; set; } = 1; // files from 0.1.0 have no version field
@@ -23,7 +23,7 @@ public sealed class Settings
         "node_modules", ".git", ".svn", ".hg", ".vs", ".idea", "__pycache__", ".venv", "venv",
         "$RECYCLE.BIN", "System Volume Information", ".cache", ".gradle", ".nuget", "obj",
         "Windows", "Program Files", "Program Files (x86)", "ProgramData", "$WinREAgent", "Recovery", "PerfLogs",
-    };
+        "AppData", "Windows.old", "$Windows.~BT", "$Windows.~WS", "$SysReset", "OneDriveTemp", "MSOCache",    };
 
     /// <summary>Absolute paths (and everything under them) that are never indexed.</summary>
     public List<string> ExcludedPaths { get; set; } = new();
@@ -204,6 +204,12 @@ public sealed class Settings
             // 30 results hid long courseware that mentions a term only a few times.
             if (MaxResults == 30) MaxResults = 60;
         }
+        if (SettingsVersion < 6)
+        {
+            // 0.7.1: AppData and similar system folders are skipped wherever they appear.
+            foreach (var name in new Settings().ExcludedDirNames)
+                if (!ExcludedDirNames.Contains(name, StringComparer.OrdinalIgnoreCase)) ExcludedDirNames.Add(name);
+        }
         if (SettingsVersion is >= 4 and < 5)
         {
             // 0.7.0: spreadsheet text is read again by default (with a per-file budget).
@@ -242,8 +248,46 @@ public sealed class Settings
         };
         var oneDrive = Environment.GetEnvironmentVariable("OneDrive");
         if (!string.IsNullOrEmpty(oneDrive)) candidates.Add(oneDrive);
+        candidates.AddRange(SystemDriveFolders(home));
         candidates.AddRange(DataDrives());
         return Dedupe(candidates.Where(p => !string.IsNullOrEmpty(p) && Directory.Exists(p)));
+    }
+
+    /// <summary>
+    /// The user's own folders on the system drive besides the standard ones: other folders in the
+    /// profile (e.g. C:\Users\me\工作) and top-level folders such as C:\资料. People with a single-drive
+    /// laptop keep their files there, and they were not searched before 0.7.1. The system's own
+    /// folders (Windows, Program Files, ProgramData, AppData, other users…) are left out, and so is the
+    /// drive root itself: watching all of C:\ would mean following every write Windows makes.
+    /// </summary>
+    // Drivers and services that put folders at C:\ (skipped only there: D:\研究\NVIDIA is the user's).
+    private static readonly string[] SystemRootJunk = { "inetpub", "Intel", "AMD", "NVIDIA", "XboxGames", "Drivers", "ESD" };
+
+    public IEnumerable<string> SystemDriveFolders(string home)
+    {
+        if (!OperatingSystem.IsWindows()) return Array.Empty<string>();
+        var system = Path.GetPathRoot(Environment.GetFolderPath(Environment.SpecialFolder.Windows)) ?? @"C:\";
+        var users = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(home));
+        var list = new List<string>();
+        void AddChildren(string? dir)
+        {
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+            try
+            {
+                foreach (var d in new DirectoryInfo(dir).EnumerateDirectories())
+                {
+                    if ((d.Attributes & (FileAttributes.Hidden | FileAttributes.System | FileAttributes.ReparsePoint)) != 0) continue;
+                    if (d.Name.StartsWith('.') || d.Name.StartsWith('$') || ExcludedDirNames.Contains(d.Name, StringComparer.OrdinalIgnoreCase)) continue;
+                    if (users != null && d.FullName.Equals(users, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (dir == system && SystemRootJunk.Contains(d.Name, StringComparer.OrdinalIgnoreCase)) continue;
+                    list.Add(d.FullName);
+                }
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+        AddChildren(system);
+        AddChildren(home);
+        return list;
     }
 
     /// <summary>Local fixed drives other than the system drive (whose user folders are covered above).</summary>

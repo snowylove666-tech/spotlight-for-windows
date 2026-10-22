@@ -83,6 +83,16 @@ internal static partial class Platform
 
     /// <summary>Lets Windows 11 draw the rounded corners, border and shadow, so the window outline is
     /// drawn once (our own rounded border on top of Windows' produced a doubled edge at each corner).</summary>
+    /// <summary>A plain Windows OK/Cancel question; true for OK.</summary>
+    public static bool Confirm(string title, string text)
+    {
+        const uint MB_OKCANCEL = 0x1, MB_ICONQUESTION = 0x20, MB_SETFOREGROUND = 0x10000, MB_TOPMOST = 0x40000;
+        return MessageBox(IntPtr.Zero, text, title, MB_OKCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == 1;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "MessageBoxW")]
+    private static extern int MessageBox(IntPtr hwnd, string text, string caption, uint type);
+
     public static bool RoundCorners(IntPtr hwnd)
     {
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000) || hwnd == IntPtr.Zero) return false;
@@ -104,6 +114,19 @@ internal static partial class Platform
         using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
         if (key?.GetValue(RunValue) is string current && current != StartupCommand)
             key.SetValue(RunValue, StartupCommand);
+    }
+
+    /// <summary>Records where the index lives (HKCU\Software\SpotlightWin), so the uninstaller can
+    /// delete it: reading that path back out of settings.json is beyond the installer's script.</summary>
+    public static void RememberIndexFolder(string folder)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\SpotlightWin");
+            key.SetValue("IndexFolder", folder);
+        }
+        catch (Exception) { }
     }
 
     private static string StartupCommand => $"\"{Environment.ProcessPath}\" --background";
