@@ -97,6 +97,7 @@ public partial class App : Application
 
         SingleInstance.ListenForShow(() => Dispatcher.UIThread.Post(_window.ShowSearch));
         try { Platform.RefreshStartupEntry(); } catch (Exception) { }
+        Platform.DeleteOldCopies();
         CreateTrayIcon();
 
         desktop.ShutdownRequested += (_, _) => Cleanup();

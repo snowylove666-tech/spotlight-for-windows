@@ -129,6 +129,21 @@ internal static partial class Platform
         catch (Exception) { }
     }
 
+    /// <summary>Deletes "SpotlightWin.exe.old…" files next to the exe: setup renames the old exe
+    /// when it is still running and cannot be deleted (see installer\SpotlightWin.iss).</summary>
+    public static void DeleteOldCopies()
+    {
+        try
+        {
+            var exe = Environment.ProcessPath;
+            var dir = exe == null ? null : Path.GetDirectoryName(exe);
+            if (dir == null) return;
+            foreach (var f in Directory.EnumerateFiles(dir, Path.GetFileName(exe) + ".old*"))
+                try { File.Delete(f); } catch (Exception) { }
+        }
+        catch (Exception) { }
+    }
+
     private static string StartupCommand => $"\"{Environment.ProcessPath}\" --background";
 
     public static bool StartsWithWindows

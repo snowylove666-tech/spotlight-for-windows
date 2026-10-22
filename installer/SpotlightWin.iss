@@ -52,6 +52,10 @@ zh.Startup=启动：
 en.Startup=Startup:
 zh.RemoveOld=发现旧版本的聚焦搜索：%n%n%1%n%n要删除这个旧版本吗？（推荐，索引和设置会保留）
 en.RemoveOld=An older copy of SpotlightWin was found:%n%n%1%n%nDelete it? (Recommended; the index and settings are kept.)
+zh.StillRunning=旧版本的聚焦搜索还在运行（可能是以管理员身份启动的），安装程序无法关闭它。%n%n新版本已经安装好，旧版本会在重启电脑后消失。也可以现在在任务栏右下角的放大镜图标上右键 →「退出」，再从开始菜单打开聚焦搜索。
+en.StillRunning=An older SpotlightWin is still running (perhaps started as administrator) and setup could not close it.%n%nThe new version is installed; the old one goes away when you restart Windows, or quit it now from its tray icon and open SpotlightWin from the Start menu.
+zh.CannotReplace=无法替换 %1%n%n请在任务栏右下角的放大镜图标上右键 →「退出」聚焦搜索，再点「重试」；或者返回上一步选择其他安装位置。
+en.CannotReplace=Cannot replace %1%n%nQuit SpotlightWin from its tray icon and try again, or go back and choose another folder.
 zh.UninstallShortcut=卸载 聚焦搜索
 en.UninstallShortcut=Uninstall SpotlightWin
 
@@ -84,6 +88,7 @@ const
 
 var
   OldAutostartExe: String;
+  OldStillRunning: Boolean;
 
 // The exe an autostart entry (ours or an older version's) points to.
 function AutostartExe(): String;
@@ -117,6 +122,39 @@ begin
   Result := WizardSilent() or (MsgBox(Text, mbConfirmation, MB_YESNO) = IDYES);
 end;
 
+// Makes room for the new exe. Stopping the app does not free its file at once, and an app started
+// as administrator, or an antivirus scan, can keep it busy: wait a few seconds, then move the old
+// file aside (Windows allows renaming a running exe, not deleting it). The renamed copy is deleted
+// by the next setup or by the app when it next starts.
+function FreeOldExe(Exe: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := True;
+  for I := 1 to 40 do
+  begin
+    if not FileExists(Exe) then exit;
+    if DeleteFile(Exe) then exit;
+    Sleep(250);
+  end;
+  Result := RenameFile(Exe, Exe + '.old' + GetDateTimeString('yyyymmddhhnnss', #0, #0));
+  OldStillRunning := Result;
+end;
+
+procedure DeleteOldCopies(Dir: String);
+var
+  F: TFindRec;
+begin
+  if FindFirst(AddBackslash(Dir) + '{#AppExe}.old*', F) then
+  try
+    repeat
+      DeleteFile(AddBackslash(Dir) + F.Name);
+    until not FindNext(F);
+  finally
+    FindClose(F);
+  end;
+end;
+
 // The app lives in the tray and has no window to close politely, so stop it before replacing
 // the exe; it is started again at the end of setup. An earlier install in another folder is
 // uninstalled (keeping the index and settings).
@@ -128,6 +166,12 @@ begin
   OldAutostartExe := AutostartExe();
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Sleep(500);
+  DeleteOldCopies(WizardDirValue());
+  if not FreeOldExe(AddBackslash(WizardDirValue()) + '{#AppExe}') then
+  begin
+    Result := FmtMessage(CustomMessage('CannotReplace'), [AddBackslash(WizardDirValue()) + '{#AppExe}']);
+    exit;
+  end;
   if RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation', OldDir) and (OldDir <> '')
      and not SamePath(OldDir, WizardDirValue()) and DirExists(OldDir) then
   begin
@@ -146,6 +190,7 @@ var
   NewExe: String;
 begin
   if CurStep <> ssPostInstall then exit;
+  if OldStillRunning then MsgBox(CustomMessage('StillRunning'), mbInformation, MB_OK);
   // Unticking "start automatically" on an upgrade must also remove an entry an older install or
   // the app itself created.
   if not WizardIsTaskSelected('autostart') then
