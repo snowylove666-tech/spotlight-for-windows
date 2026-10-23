@@ -196,6 +196,44 @@ internal static partial class Platform
         if (OperatingSystem.IsWindows()) AllowSetForegroundWindow(-1 /* ASFW_ANY */);
     }
 
+    // ---------------------------------------------------------------- close requests
+
+    private delegate IntPtr SubclassProc(IntPtr hwnd, uint msg, IntPtr w, IntPtr l, UIntPtr id, UIntPtr data);
+    private static SubclassProc? _declineProc; // kept alive: Windows calls it
+    private static Action? _declined;
+
+    /// <summary>
+    /// Windows asks running programs to close in two cases: the user signs out or shuts down, and
+    /// another program's installer or updater wants files this one has open (the Restart Manager,
+    /// which Office updates use). The second used to end the app without the user knowing. That
+    /// request carries ENDSESSION_CLOSEAPP; every window of this (UI) thread now answers it "no",
+    /// and the installer then asks the user whether to close us. Signing out is answered as before.
+    /// Call on the UI thread once its windows exist.
+    /// </summary>
+    public static void DeclineCloseRequestsFromOtherPrograms(Action declined)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        _declined = declined;
+        _declineProc ??= (hwnd, msg, w, l, id, data) =>
+        {
+            const uint WM_QUERYENDSESSION = 0x0011, WM_ENDSESSION = 0x0016;
+            const long ENDSESSION_CLOSEAPP = 0x1;
+            if ((msg == WM_QUERYENDSESSION || msg == WM_ENDSESSION) && (l.ToInt64() & ENDSESSION_CLOSEAPP) != 0)
+            {
+                if (msg == WM_QUERYENDSESSION) _declined?.Invoke();
+                return IntPtr.Zero; // FALSE: not closing (and an ENDSESSION for it is ignored)
+            }
+            return DefSubclassProc(hwnd, msg, w, l);
+        };
+        EnumThreadWindows(GetCurrentThreadId(), (hwnd, _) => { SetWindowSubclass(hwnd, _declineProc, (UIntPtr)0x5370, UIntPtr.Zero); return true; }, IntPtr.Zero);
+    }
+
+    private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr l);
+    [DllImport("user32.dll")] private static extern bool EnumThreadWindows(uint thread, EnumWindowsProc proc, IntPtr l);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("comctl32.dll")] private static extern bool SetWindowSubclass(IntPtr hwnd, SubclassProc proc, UIntPtr id, UIntPtr data);
+    [DllImport("comctl32.dll")] private static extern IntPtr DefSubclassProc(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
+
     /// <summary>Brings our window to the front. Windows allows this right after our hotkey fired.</summary>
     public static void ForceForeground(IntPtr hwnd)
     {

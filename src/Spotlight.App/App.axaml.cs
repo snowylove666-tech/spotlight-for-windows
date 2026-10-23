@@ -100,6 +100,12 @@ public partial class App : Application
         Platform.DeleteOldCopies();
         CreateTrayIcon();
 
+        // Windows asks running programs to close in two cases: the user signs out or shuts down, and
+        // another program's installer or updater wants files we have open (the "Restart Manager";
+        // Office updates do this). The second one used to end the app silently. Only the user
+        // decides that: we decline, and that installer then asks the user whether to close us.
+        if (OperatingSystem.IsWindows())
+            Platform.DeclineCloseRequestsFromOtherPrograms(() => ErrorLog.Note("another program (an installer or updater) asked us to close: declined, the user decides"));
         desktop.ShutdownRequested += (_, e) => { ErrorLog.Note("shutdown requested (Windows signing out or shutting down)"); Cleanup(); };
         // Back from sleep: register the hotkey again (another program may have taken it meanwhile) and
         // note it, so the log shows the app came through standby.
