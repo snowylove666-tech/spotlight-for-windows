@@ -91,7 +91,7 @@ public sealed class Release070Tests : IDisposable
         var s = Settings.Load(path);
         Assert.Equal(new[] { "Pdf", "Word", "Spreadsheet" }, s.ContentCategories);
         Assert.False(s.FullContentIndex);
-        Assert.Contains("\"SettingsVersion\": 6", File.ReadAllText(path));
+        Assert.Contains("\"SettingsVersion\": 7", File.ReadAllText(path));
     }
 
     [Fact]

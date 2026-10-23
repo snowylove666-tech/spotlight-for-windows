@@ -38,15 +38,17 @@
       <StackPanel>
         <TextBlock Classes="h" Text="启动" />
         <CheckBox x:Name="AutostartCheck" Content="开机自动启动（在后台运行，不弹出窗口）" />
+        <TextBlock Classes="hint" Text="也可以在托盘图标的右键菜单里随时打开或关闭。" Margin="0,2,0,0" />
         <StackPanel Orientation="Horizontal" Spacing="10" Margin="0,8,0,0">
           <Button x:Name="UninstallButton" Content="卸载聚焦搜索…" />
           <TextBlock Classes="hint" VerticalAlignment="Center" Text="同时删除索引文件和设置，你的文档不受影响。" />
         </StackPanel>
-        <TextBlock Classes="hint" Text="也可以在托盘图标的右键菜单里随时打开或关闭。" Margin="0,2,0,0" />
 
         <TextBlock Classes="h" Text="快捷键" />
-        <TextBox x:Name="HotkeyBox" Width="220" HorizontalAlignment="Left" Watermark="例如 Alt+Space" />
-        <TextBlock Classes="hint" Text="可用 Ctrl、Alt、Shift、Win 加一个键，例如 Alt+Space、Ctrl+Shift+F、Win+F2。" Margin="0,4,0,0" />
+        <TextBox x:Name="HotkeyBox" Width="220" HorizontalAlignment="Left" IsReadOnly="True" Cursor="Hand"
+                 Watermark="点这里，然后按下新的快捷键" />
+        <TextBlock x:Name="HotkeyHint" Classes="hint" Margin="0,4,0,0"
+                   Text="点一下上面的框，直接按下想用的组合键（例如 Ctrl+Space、Ctrl+Shift+F、Alt+Q）。至少要带一个 Ctrl、Alt、Shift 或 Win，F1–F12 可以单独用。" />
 
         <TextBlock Classes="h" Text="搜索位置" />
         <TextBlock x:Name="RootsHint" Classes="hint" />

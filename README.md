@@ -1,10 +1,10 @@
 # 聚焦搜索 SpotlightWin — Spotlight for Windows
 
-在 Windows 上使用的「聚焦搜索」：按 `Alt+Space` 唤起，输入关键词，立刻找到应用、文件、文件夹，以及 PDF、Word、Excel、PowerPoint、文本文件里的文字；右侧直接预览命中的那一页，回车打开并跳到该页。
+在 Windows 上使用的「聚焦搜索」：按 `Ctrl+Space` 唤起，输入关键词，立刻找到应用、文件、文件夹，以及 PDF、Word、Excel、PowerPoint、文本文件里的文字；右侧直接预览命中的那一页，回车打开并跳到该页。
 
 **[⬇ 下载最新版](https://github.com/snowylove666-tech/spotlight-for-windows/releases/latest)**：推荐 `SpotlightWin-Setup-x.y.z.exe` 安装包（不需要管理员权限，带开始菜单、开机启动和卸载）；也可以下载单独的 `SpotlightWin.exe` 免安装直接运行。无需 .NET，Windows 10/11 x64。
 
-> **English:** A macOS Spotlight–style launcher and desktop search for Windows. Press `Alt+Space` to instantly find apps, files and the text inside PDF / Word / PowerPoint documents (Chinese supported), preview the matching page with highlights, and open it right at that page. Fully local and private; a single portable exe built with C# / .NET 10, Avalonia and SQLite FTS5.
+> **English:** A macOS Spotlight–style launcher and desktop search for Windows. Press `Ctrl+Space` to instantly find apps, files and the text inside PDF / Word / PowerPoint documents (Chinese supported), preview the matching page with highlights, and open it right at that page. Fully local and private; a single portable exe built with C# / .NET 10, Avalonia and SQLite FTS5.
 
 ![浅色模式](docs/images/light.png)
 ![深色模式：按正文搜索](docs/images/dark.png)
@@ -23,14 +23,14 @@
 
 1. 运行 `SpotlightWin-Setup-x.y.z.exe`，可以选择安装位置，会创建开始菜单和桌面图标。安装新版本时会自动删除旧版本（包括以前放在别处的免安装版），索引和设置会保留。不需要安装 .NET。也可以直接运行免安装的 `SpotlightWin.exe`。
 2. 首次运行会弹出搜索窗口，同时在后台建立索引，托盘区出现放大镜图标。索引进度显示在窗口底部。
-3. 之后随时按 `Alt+Space` 唤起。托盘图标右键 →「设置…」可以修改快捷键、搜索位置、排除的文件夹和文件类型、开机自动启动。从托盘退出后，可以通过开始菜单或桌面上的「聚焦搜索」图标重新打开。
+3. 之后随时按 `Ctrl+Space` 唤起（在「设置」里点快捷键框、直接按下新的组合键即可更换）。托盘图标右键 →「设置…」可以修改快捷键、搜索位置、排除的文件夹和文件类型、开机自动启动。从托盘退出后，可以通过开始菜单或桌面上的「聚焦搜索」图标重新打开。
 4. 卸载：「设置」里的「卸载聚焦搜索…」，或者 Windows「设置 → 应用」、开始菜单里的「卸载 聚焦搜索」。卸载会同时删除索引文件和设置，你的文档不受影响。
 
 > Windows SmartScreen 可能提示「未知发布者」，因为 exe 没有代码签名。点「更多信息 → 仍要运行」即可。
 
 | 按键 | 作用 |
 | --- | --- |
-| `Alt+Space` | 唤起 / 隐藏 |
+| `Ctrl+Space` | 唤起 / 隐藏 |
 | `↑` `↓` | 选择结果 |
 | `Tab` / `Shift+Tab` | 切换结果类型筛选（全部、应用、文件夹、PDF、文稿、表格、演示、图片、音视频、文本代码、其他）；右侧可按相关、日期、名称、大小、格式排序，再点一次反转顺序 |
 | `Ctrl+←` `Ctrl+→` | PDF 预览上一页、下一页；滚轮滚过页底也会翻页 |

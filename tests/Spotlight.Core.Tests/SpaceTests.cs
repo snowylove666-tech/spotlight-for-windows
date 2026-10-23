@@ -141,7 +141,7 @@ public sealed class SpaceTests : IDisposable
         var s = Settings.Load(path);
         Assert.Equal(Settings.DefaultContentCategories(), s.ContentCategories);
         Assert.NotNull(s.IndexFolder);
-        Assert.Contains("\"SettingsVersion\": 6", File.ReadAllText(path));
+        Assert.Contains("\"SettingsVersion\": 7", File.ReadAllText(path));
         Assert.Equal(s.IndexFolder, Settings.Load(path).IndexFolder);
     }
 }

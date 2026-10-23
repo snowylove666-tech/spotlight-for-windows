@@ -5,13 +5,13 @@ namespace Spotlight.Core;
 
 public sealed class Settings
 {
-    public const int CurrentVersion = 6;
+    public const int CurrentVersion = 7;
 
     /// <summary>Format version of this file; older files are upgraded on load.</summary>
     public int SettingsVersion { get; set; } = 1; // files from 0.1.0 have no version field
 
-    /// <summary>Global hotkey, e.g. "Alt+Space", "Ctrl+Shift+Space", "Win+F2".</summary>
-    public string Hotkey { get; set; } = "Alt+Space";
+    /// <summary>Global hotkey, e.g. "Ctrl+Space", "Ctrl+Shift+Space", "Win+F2".</summary>
+    public string Hotkey { get; set; } = "Ctrl+Space";
 
     /// <summary>Folders to index. Empty means the user's standard folders (Desktop, Documents, Downloads, ...)
     /// plus every other local fixed drive (D:\, E:\ ...).</summary>
@@ -203,6 +203,11 @@ public sealed class Settings
         {
             // 30 results hid long courseware that mentions a term only a few times.
             if (MaxResults == 30) MaxResults = 60;
+        }
+        if (SettingsVersion < 7)
+        {
+            // 0.7.4: the default is Ctrl+Space; people still on the old default move with it.
+            if (Hotkey.Replace(" ", "").Equals("Alt+Space", StringComparison.OrdinalIgnoreCase)) Hotkey = "Ctrl+Space";
         }
         if (SettingsVersion < 6)
         {

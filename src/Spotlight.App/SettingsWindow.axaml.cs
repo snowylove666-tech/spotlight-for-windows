@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Platform.Storage;
 using Spotlight.Core;
 
@@ -50,6 +51,10 @@ public partial class SettingsWindow : Window
     /// <summary>Raised after the settings were saved; the caller re-registers the hotkey and re-indexes.</summary>
     public event Action? Saved;
 
+    /// <summary>True while the hotkey box has the focus and records keys; the app pauses the current
+    /// hotkey meanwhile, or pressing it would open the search window instead of being recorded.</summary>
+    public event Action<bool>? HotkeyRecording;
+
     /// <summary>The user asked to remove the app (the app confirms and does it).</summary>
     public event Action? UninstallRequested;
 
@@ -63,6 +68,15 @@ public partial class SettingsWindow : Window
         ExcludedList.ItemsSource = _excluded;
 
         HotkeyBox.Text = settings.Hotkey;
+        HotkeyBox.AddHandler(KeyDownEvent, OnHotkeyKeyDown, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        HotkeyBox.GotFocus += (_, _) => { _hotkeyBefore = HotkeyBox.Text; HotkeyRecording?.Invoke(true); };
+        HotkeyBox.LostFocus += (_, _) =>
+        {
+            // Only modifiers were pressed (e.g. "Ctrl+…"): keep the previous hotkey.
+            if (!GlobalHotkey.TryParse(HotkeyBox.Text ?? "", out _, out _)) HotkeyBox.Text = _hotkeyBefore;
+            HotkeyRecording?.Invoke(false);
+        };
+        Closed += (_, _) => { if (HotkeyBox.IsFocused) HotkeyRecording?.Invoke(false); };
         SetRoots(settings.Roots.Count == 0 ? settings.EffectiveRoots() : settings.Roots, settings.Roots.Count == 0);
         foreach (var p in settings.ExcludedPaths) _excluded.Add(p);
         foreach (var (kind, label) in Kinds)
@@ -158,12 +172,61 @@ public partial class SettingsWindow : Window
         try { return Platform.StartsWithWindows; } catch (Exception) { return false; }
     }
 
+    private string? _hotkeyBefore;
+
+    /// <summary>Turns the keys pressed in the hotkey box into "Ctrl+Shift+F" and so on.</summary>
+    private void OnHotkeyKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Tab && e.KeyModifiers == KeyModifiers.None) return; // move on to the next field
+        e.Handled = true;
+        if (e.KeyModifiers == KeyModifiers.None && e.Key is Key.Escape or Key.Back or Key.Delete)
+        {
+            HotkeyBox.Text = _hotkeyBefore; // cancel
+            return;
+        }
+        var text = HotkeyText(e.KeyModifiers, e.Key);
+        HotkeyBox.Text = text ?? ModifierText(e.KeyModifiers) + "…";
+        Error.Text = text == null && e.KeyModifiers == KeyModifiers.None && KeyName(e.Key) != null
+            ? "单个按键不能当快捷键，请同时按住 Ctrl、Alt、Shift 或 Win。" : "";
+    }
+
+    private static string ModifierText(KeyModifiers m) =>
+        (m.HasFlag(KeyModifiers.Control) ? "Ctrl+" : "") + (m.HasFlag(KeyModifiers.Alt) ? "Alt+" : "")
+        + (m.HasFlag(KeyModifiers.Shift) ? "Shift+" : "") + (m.HasFlag(KeyModifiers.Meta) ? "Win+" : "");
+
+    /// <summary>The hotkey for these keys in the form <see cref="GlobalHotkey.TryParse"/> reads, or
+    /// null when it is not complete or not usable (a lone letter would fire while typing anywhere).</summary>
+    internal static string? HotkeyText(KeyModifiers mods, Key key)
+    {
+        var name = KeyName(key);
+        if (name == null) return null;
+        bool functionKey = key is >= Key.F1 and <= Key.F24;
+        if (mods == KeyModifiers.None && !functionKey) return null;
+        return ModifierText(mods) + name;
+    }
+
+    private static string? KeyName(Key key) => key switch
+    {
+        >= Key.A and <= Key.Z => key.ToString(),
+        >= Key.D0 and <= Key.D9 => ((int)(key - Key.D0)).ToString(),
+        >= Key.F1 and <= Key.F24 => key.ToString(),
+        Key.Space => "Space",
+        Key.Enter => "Enter",
+        Key.Insert => "Insert",
+        Key.OemTilde => "`",
+        Key.OemSemicolon => ";",
+        Key.OemQuestion => "/",
+        Key.OemPeriod => ".",
+        Key.OemComma => ",",
+        _ => null, // Ctrl, Shift… on their own, or keys the hotkey can't use
+    };
+
     private void Save()
     {
         var hotkey = (HotkeyBox.Text ?? "").Trim();
         if (!GlobalHotkey.TryParse(hotkey, out _, out _))
         {
-            Error.Text = "快捷键格式不正确，例如 Alt+Space。";
+            Error.Text = "请点快捷键框，按下一个组合键，例如 Ctrl+Space。";
             return;
         }
         if (_roots.Count == 0)

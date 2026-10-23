@@ -253,7 +253,7 @@ public partial class App : Application
         {
             // People could not find the way back after quitting a tray app.
             if (Platform.Confirm("退出聚焦搜索",
-                    "退出后 Alt+Space 将不再响应。\n\n以后可以从「开始」菜单或桌面上的「聚焦搜索」图标重新打开。\n\n确定退出吗？"))
+                    $"退出后 {_settings.Hotkey} 将不再响应。\n\n以后可以从「开始」菜单或桌面上的「聚焦搜索」图标重新打开。\n\n确定退出吗？"))
                 Quit();
         };
 
@@ -273,6 +273,12 @@ public partial class App : Application
         _settingsWindow = new SettingsWindow(_settings);
         _settingsWindow.IndexFolderChosen += folder => _ = MoveIndexTo(folder);
         _settingsWindow.UninstallRequested += Uninstall;
+        // While the hotkey box records keys, the current hotkey must not open the search window.
+        _settingsWindow.HotkeyRecording += recording =>
+        {
+            if (recording) { _hotkey?.Dispose(); _hotkey = null; }
+            else RegisterHotkey();
+        };
         _settingsWindow.Saved += () =>
         {
             if (_autostartItem != null) _autostartItem.IsChecked = SafeStartsWithWindows();
