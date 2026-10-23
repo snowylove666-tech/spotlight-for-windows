@@ -116,6 +116,15 @@ public partial class SearchWindow : Window
         Results.DoubleTapped += (_, _) => OpenSelected(reveal: false);
         AddHandler(KeyDownEvent, OnKeyDown, Avalonia.Interactivity.RoutingStrategies.Tunnel);
         // A preview handler taking the keyboard focus is not the user leaving.
+        Closing += (_, e) =>
+        {
+            // Alt+F4 or the taskbar: hide like Esc. Only quitting the app really closes the window.
+            if (e.CloseReason != WindowCloseReason.ApplicationShutdown)
+            {
+                e.Cancel = true;
+                HideSearch();
+            }
+        };
         Deactivated += (_, _) =>
         {
             if (!IsVisible || (OperatingSystem.IsWindows() && PreviewHandlerHost.IsForeground(TopHandle))) return;

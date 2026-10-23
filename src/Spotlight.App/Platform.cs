@@ -83,6 +83,17 @@ internal static partial class Platform
 
     /// <summary>Lets Windows 11 draw the rounded corners, border and shadow, so the window outline is
     /// drawn once (our own rounded border on top of Windows' produced a doubled edge at each corner).</summary>
+    /// <summary>Asks Windows to start the app again if it crashes or stops responding (after it has
+    /// run for a minute), and after a restart for updates.</summary>
+    public static void RegisterForRestart(string args)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try { RegisterApplicationRestart(args, 0); } catch (Exception) { }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern int RegisterApplicationRestart(string commandLine, int flags);
+
     /// <summary>A plain Windows OK/Cancel question; true for OK.</summary>
     public static bool Confirm(string title, string text)
     {

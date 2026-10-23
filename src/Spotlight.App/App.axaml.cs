@@ -100,7 +100,18 @@ public partial class App : Application
         Platform.DeleteOldCopies();
         CreateTrayIcon();
 
-        desktop.ShutdownRequested += (_, _) => Cleanup();
+        desktop.ShutdownRequested += (_, e) => { ErrorLog.Note("shutdown requested (Windows signing out or shutting down)"); Cleanup(); };
+        // Back from sleep: register the hotkey again (another program may have taken it meanwhile) and
+        // note it, so the log shows the app came through standby.
+        if (OperatingSystem.IsWindows())
+            Microsoft.Win32.SystemEvents.PowerModeChanged += (_, e) =>
+            {
+                if (e.Mode != Microsoft.Win32.PowerModes.Resume) return;
+                ErrorLog.Note("resumed from sleep");
+                Dispatcher.UIThread.Post(RegisterHotkey);
+            };
+        // An error in a click or a preview must not end the app that everything else relies on.
+        Dispatcher.UIThread.UnhandledException += (_, e) => { ErrorLog.Write("ui", e.Exception); e.Handled = true; };
         // Launched by the user (not by Windows at sign-in): show the window so they see it's running.
         bool background = desktop.Args?.Contains("--background") == true;
         if (!background) _window.ShowSearch();
@@ -316,6 +327,7 @@ public partial class App : Application
 
     private void Quit()
     {
+        ErrorLog.Note("quit from the tray menu");
         Cleanup();
         (ApplicationLifetime as IClassicDesktopStyleApplicationLifetime)?.Shutdown();
     }
