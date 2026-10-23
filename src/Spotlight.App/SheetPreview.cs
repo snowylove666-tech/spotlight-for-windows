@@ -4,7 +4,8 @@ using ExcelDataReader;
 namespace Spotlight.App;
 
 /// <summary>A window onto one worksheet: the rows around the first cell that matches the query.</summary>
-internal sealed record SheetView(string SheetName, int SheetCount, IReadOnlyList<int> RowNumbers, IReadOnlyList<string[]> Rows, int ColumnCount);
+/// <param name="Current">Index into <paramref name="Rows"/> of the matching row asked for (-1 for none).</param>
+internal sealed record SheetView(string SheetName, int SheetCount, IReadOnlyList<int> RowNumbers, IReadOnlyList<string[]> Rows, int ColumnCount, int Current = -1);
 
 /// <summary>
 /// Reads spreadsheets (xlsx, xlsm, xls, WPS et) for the preview pane without Office: Excel's own
@@ -12,6 +13,10 @@ internal sealed record SheetView(string SheetName, int SheetCount, IReadOnlyList
 /// </summary>
 internal static class SheetPreview
 {
+    // ExcelDataReader needs code page 1252. The extractors register it too, but after a restart with
+    // nothing left to read none of them has run, and every spreadsheet fell back to plain text.
+    static SheetPreview() => System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+
     public static bool CanPreview(string path) =>
         Path.GetExtension(path).ToLowerInvariant() is ".xlsx" or ".xlsm" or ".xls" or ".et";
 
@@ -51,14 +56,14 @@ internal static class SheetPreview
                 }
                 if (terms.Count == 0 && rows.Count >= RowsShown) break;
             }
-            if (hit >= 0) return Window(reader.Name, reader.ResultsCount, rows, hit);
-            if (skip == 0) first ??= Window(reader.Name, reader.ResultsCount, rows, 0);
+            if (hit >= 0) return Window(reader.Name, reader.ResultsCount, rows, hit, current: true);
+            if (skip == 0) first ??= Window(reader.Name, reader.ResultsCount, rows, 0, current: false);
             if (terms.Count == 0 || DateTime.UtcNow >= until) break;
         } while (reader.NextResult());
         return first;
     }
 
-    private static SheetView Window(string sheet, int sheets, List<string[]> rows, int hit)
+    private static SheetView Window(string sheet, int sheets, List<string[]> rows, int hit, bool current)
     {
         int from = Math.Max(0, hit - RowsBefore);
         var numbers = Enumerable.Range(from, Math.Min(RowsShown, rows.Count - from)).ToList();
@@ -66,7 +71,8 @@ internal static class SheetPreview
         var picked = numbers.Select(i => rows[i]).ToList();
         int columns = picked.Count == 0 ? 0 : picked.Max(r => LastFilled(r) + 1);
         return new SheetView(sheet, sheets, numbers.Select(i => i + 1).ToList(),
-            picked.Select(r => Enumerable.Range(0, columns).Select(i => i < r.Length ? r[i] : "").ToArray()).ToList(), columns);
+            picked.Select(r => Enumerable.Range(0, columns).Select(i => i < r.Length ? r[i] : "").ToArray()).ToList(), columns,
+            current ? numbers.IndexOf(hit) : -1);
     }
 
     private static int LastFilled(string[] row)

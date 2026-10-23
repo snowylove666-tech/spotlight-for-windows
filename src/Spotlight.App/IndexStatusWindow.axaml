@@ -1,0 +1,64 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Spotlight.App.IndexStatusWindow"
+        Title="聚焦搜索 索引状态"
+        Width="560" Height="640" MinWidth="440" MinHeight="420"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Microsoft YaHei UI, Segoe UI, WenQuanYi Zen Hei, sans-serif">
+  <Window.Styles>
+    <Style Selector="TextBlock.h">
+      <Setter Property="FontSize" Value="15" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Margin" Value="0,16,0,6" />
+    </Style>
+    <Style Selector="TextBlock.hint">
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Opacity" Value="0.65" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+    <Style Selector="TextBlock.line">
+      <Setter Property="FontSize" Value="13" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+      <Setter Property="Margin" Value="0,2" />
+    </Style>
+  </Window.Styles>
+
+  <DockPanel>
+    <Border DockPanel.Dock="Bottom" BorderThickness="0,1,0,0" BorderBrush="{DynamicResource DividerBrush}" Padding="20,12">
+      <Grid ColumnDefinitions="*,Auto,Auto">
+        <TextBlock x:Name="Footer" Classes="hint" VerticalAlignment="Center" />
+        <Button x:Name="RescanButton" Grid.Column="1" Content="重新扫描所有文件" Margin="8,0" />
+        <Button x:Name="CloseButton" Grid.Column="2" Content="关闭" MinWidth="80" HorizontalContentAlignment="Center" />
+      </Grid>
+    </Border>
+
+    <ScrollViewer Padding="24,4,24,20">
+      <StackPanel>
+        <!-- What is happening now, and the outcome of the scan the user asked for. -->
+        <Border x:Name="Banner" IsVisible="False" CornerRadius="8" Padding="14,10" Margin="0,14,0,0">
+          <TextBlock x:Name="BannerText" FontSize="13" TextWrapping="Wrap" />
+        </Border>
+
+        <TextBlock Classes="h" Text="当前状态" />
+        <TextBlock x:Name="Phase" Classes="line" FontWeight="SemiBold" />
+        <TextBlock x:Name="Counts" Classes="line" />
+        <TextBlock x:Name="Size" Classes="line" />
+
+        <TextBlock Classes="h" Text="上次扫描" />
+        <TextBlock x:Name="LastScan" Classes="line" />
+
+        <TextBlock Classes="h" Text="搜索范围" />
+        <TextBlock x:Name="Scope" Classes="line" />
+        <TextBlock x:Name="Roots" Classes="hint" Margin="0,4,0,0" />
+
+        <TextBlock Classes="h" Text="正文（按内容搜索）" />
+        <TextBlock x:Name="Content" Classes="line" />
+
+        <TextBlock Classes="h" Text="不会收录的内容" />
+        <TextBlock x:Name="Excluded" Classes="line" />
+        <TextBlock Classes="hint" Margin="0,6,0,0"
+                   Text="某个文件搜不到时，先看它是否属于上面这些情况；可以在托盘菜单的「设置」里调整。" />
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
+</Window>

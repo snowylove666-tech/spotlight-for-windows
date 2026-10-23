@@ -240,8 +240,10 @@ public partial class App : Application
         _showItem.Click += (_, _) => _window.ShowSearch();
         var settings = new NativeMenuItem("设置…");
         settings.Click += (_, _) => OpenSettings();
+        var status = new NativeMenuItem("索引状态…");
+        status.Click += (_, _) => OpenIndexStatus();
         var rescan = new NativeMenuItem("重新扫描所有文件");
-        rescan.Click += (_, _) => _indexer.RequestFullRescan();
+        rescan.Click += (_, _) => Rescan();
         _autostartItem = new NativeMenuItem("开机自动启动") { ToggleType = NativeMenuItemToggleType.CheckBox, IsChecked = SafeStartsWithWindows() };
         _autostartItem.Click += (_, _) =>
         {
@@ -261,15 +263,42 @@ public partial class App : Application
         {
             Icon = new WindowIcon(iconStream),
             ToolTipText = "聚焦搜索",
-            Menu = new NativeMenu { _showItem, new NativeMenuItemSeparator(), settings, _autostartItem, rescan, new NativeMenuItemSeparator(), quit },
+            Menu = new NativeMenu { _showItem, new NativeMenuItemSeparator(), settings, _autostartItem, status, rescan, new NativeMenuItemSeparator(), quit },
         };
         _tray.Clicked += (_, _) => _window.ShowSearch();
         TrayIcon.SetIcons(this, new TrayIcons { _tray });
     }
 
+    private IndexStatusWindow? _statusWindow;
+
+    private IndexStatusWindow OpenIndexStatus()
+    {
+        if (_statusWindow == null)
+        {
+            _statusWindow = new IndexStatusWindow(_settings, () => (_indexer, _store));
+            _statusWindow.RescanRequested += Rescan;
+            _statusWindow.Closed += (_, _) => { _statusWindow = null; ScheduleTrim(); };
+            _statusWindow.Show();
+        }
+        _statusWindow.Activate();
+        return _statusWindow;
+    }
+
+    /// <summary>"重新扫描所有文件": shows what the index holds now and, as it goes, what the scan changed.</summary>
+    private void Rescan()
+    {
+        OpenIndexStatus().Track("重新扫描所有文件");
+        _indexer.RequestFullRescan();
+    }
+
+    /// <summary>The settings that decide which text is read, to tell whether a save changes the index size.</summary>
+    private string ContentSignature() =>
+        $"{_settings.IndexContents}|{_settings.FullContentIndex}|{string.Join(",", _settings.ContentCategories.Order())}|{string.Join(",", _settings.ExcludedContentPaths)}";
+
     private void OpenSettings()
     {
         if (_settingsWindow != null) { _settingsWindow.Activate(); return; }
+        string contentBefore = ContentSignature();
         _settingsWindow = new SettingsWindow(_settings);
         _settingsWindow.IndexFolderChosen += folder => _ = MoveIndexTo(folder);
         _settingsWindow.UninstallRequested += Uninstall;
@@ -285,6 +314,12 @@ public partial class App : Application
             RegisterHotkey();
             // New locations or filters: restart the indexer. Its first full crawl adds what is now in
             // scope and removes what is not.
+            // Changing what text is read grows or shrinks the index: show by how much as it happens.
+            bool contentChanged = ContentSignature() != contentBefore;
+            IndexStatusWindow? statusWindow = contentChanged ? OpenIndexStatus() : null;
+            statusWindow?.Track(!_settings.IndexContents ? "已关闭正文搜索"
+                : _settings.FullContentIndex ? "已开启完整正文索引" : "已改为部分正文索引");
+            contentBefore = ContentSignature();
             _indexer.Dispose();
             StartIndexer();
         };

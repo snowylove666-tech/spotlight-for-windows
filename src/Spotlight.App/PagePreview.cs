@@ -128,11 +128,16 @@ internal static class PagePreview
 
     /// <summary>Up to a few thousand characters starting a little before <paramref name="hit"/>
     /// (or at the top when there is none).</summary>
-    internal static string TextWindow(string text, int hit)
+    internal static string TextWindow(string text, int hit) => TextWindow(text, hit, out _);
+
+    /// <param name="local">Where <paramref name="hit"/> is in the returned text (-1 for none).</param>
+    internal static string TextWindow(string text, int hit, out int local)
     {
         int start = hit <= 300 ? 0 : text.LastIndexOf('\n', hit - 300) + 1;
         int length = Math.Min(text.Length - start, 8000);
-        return (start > 0 ? "…\n" : "") + text.Substring(start, length) + (start + length < text.Length ? "\n…" : "");
+        string prefix = start > 0 ? "…\n" : "";
+        local = hit < 0 ? -1 : hit - start + prefix.Length;
+        return prefix + text.Substring(start, length) + (start + length < text.Length ? "\n…" : "");
     }
 
     private static List<Rect> SafeBoxes(PdfDocument doc, int pageNumber, List<string> terms)

@@ -208,6 +208,7 @@ public sealed class IndexStore : IDisposable
             ins.Parameters.AddWithValue("$g", gen);
             ins.Parameters.AddWithValue("$w", wants ? 1 : 0);
             long id = Convert.ToInt64(ins.ExecuteScalar());
+            Inserted++;
 
             using var fts = Cmd("INSERT INTO names_fts(rowid, tokens) VALUES($id, $t);");
             fts.Parameters.AddWithValue("$id", id);
@@ -435,7 +436,9 @@ public sealed class IndexStore : IDisposable
             foreach (var (k, v) in args) c.Parameters.AddWithValue(k, v);
             c.ExecuteNonQuery();
             using var n = Cmd("SELECT COUNT(*) FROM doomed;");
-            return Convert.ToInt32(n.ExecuteScalar());
+            int count = Convert.ToInt32(n.ExecuteScalar());
+            Deleted += count;
+            return count;
         }
         finally { if (own) CommitBatch(); }
     }
@@ -622,6 +625,21 @@ public sealed class IndexStore : IDisposable
     }
 
     // ---------------------------------------------------------------- stats
+
+    /// <summary>Rows added since the store was opened (for "新增 n 个" after a scan).</summary>
+    public long Inserted { get; private set; }
+
+    /// <summary>Rows removed since the store was opened (for "删除 n 个" after a scan).</summary>
+    public long Deleted { get; private set; }
+
+    /// <summary>Bytes the index takes on disk (database plus its write-ahead log).</summary>
+    public long SizeBytes()
+    {
+        long total = 0;
+        foreach (var f in new[] { DbPath, DbPath + "-wal" })
+            try { var i = new FileInfo(f); if (i.Exists) total += i.Length; } catch (IOException) { }
+        return total;
+    }
 
     public (long files, long withContent) Counts()
     {

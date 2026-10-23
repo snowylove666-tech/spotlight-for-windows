@@ -6,6 +6,13 @@ namespace Spotlight.Core.Indexing;
 
 public enum IndexPhase { Starting, Scanning, ReadingContents, Idle, PausedOnBattery }
 
+/// <summary>What one full scan found: shown after "重新扫描" so the user can see it ran and what changed.</summary>
+public sealed record ScanReport(DateTime Started, DateTime Finished, long FilesBefore, long FilesAfter,
+    long Added, long Removed, long SizeBefore, long SizeAfter, IReadOnlyList<string> MissingRoots, int TextDropped)
+{
+    public TimeSpan Took => Finished - Started;
+}
+
 public sealed record IndexStatus(IndexPhase Phase, long Files, long WithContent, int PendingContent, string? Detail = null,
     bool Fast = false, TimeSpan? Remaining = null)
 {
@@ -44,6 +51,11 @@ public sealed class Indexer : IDisposable
     private volatile bool _fullRescanRequested;
 
     public event Action<IndexStatus>? StatusChanged;
+
+    /// <summary>Raised on the indexer thread after each full scan.</summary>
+    public event Action<ScanReport>? ScanFinished;
+    public ScanReport? LastScan { get; private set; }
+    private int _textDropped;
 
     /// <summary>Raised on the indexer thread whenever it has caught up and is about to sleep.</summary>
     public event Action? Idle;
@@ -171,7 +183,7 @@ public sealed class Indexer : IDisposable
         // Older versions indexed the index itself (see _ownFiles).
         foreach (var suffix in new[] { "", "-wal", "-shm", "-journal", ".moving" }) _store.DeletePath(_ownFiles + suffix);
         _store.ReclassifyExecutables();
-        int dropped = _store.PurgeIneligibleContent();
+        int dropped = _textDropped = _store.PurgeIneligibleContent();
         if (dropped == 0) return;
         if (dropped > 500) _store.Optimize();
         _store.ReleaseSpace();
@@ -179,10 +191,19 @@ public sealed class Indexer : IDisposable
 
     private void FullScan(CancellationToken ct)
     {
+        var started = DateTime.Now;
+        var (before, _) = _store.Counts();
+        long sizeBefore = _store.SizeBytes(), insertedBefore = _store.Inserted, deletedBefore = _store.Deleted;
         long gen = _store.NextGeneration();
         foreach (var root in Roots) ScanRoot(root, gen, ct);
         // Anything not seen by this crawl is gone, outside the configured locations, or now filtered out.
         _store.DeleteOlderThan(gen);
+        var (after, _) = _store.Counts();
+        // Each root sweeps its own stale rows as it finishes; count those too.
+        LastScan = new ScanReport(started, DateTime.Now, before, after, _store.Inserted - insertedBefore, _store.Deleted - deletedBefore,
+            sizeBefore, _store.SizeBytes(), Roots.Where(r => !Directory.Exists(r)).ToList(), _textDropped);
+        _textDropped = 0;
+        ScanFinished?.Invoke(LastScan);
     }
 
     /// <summary>Crawls one root again (its watcher lost events). Roots nested in it (e.g. the Start

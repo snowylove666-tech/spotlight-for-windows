@@ -142,6 +142,10 @@ public partial class SearchWindow : Window
         NextHit.Click += (_, _) => StepHit(+1);
         PrevHit.Click += (_, _) => StepHit(-1);
         PreviewScroll.AddHandler(PointerWheelChangedEvent, OnPreviewWheel, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        _keyboardGuard.Tick += (_, _) =>
+        {
+            if (OperatingSystem.IsWindows() && Handler.IsVisible && PreviewHandlerHost.KeepKeyboard(TopHandle)) Query.Focus();
+        };
         Opened += (_, _) =>
         {
             // Windows 11 rounds the window and draws its edge; a second rounded border of our own on
@@ -179,11 +183,16 @@ public partial class SearchWindow : Window
         Platform.ForceForeground(TryGetPlatformHandle()?.Handle ?? IntPtr.Zero);
         Query.Focus();
         Query.SelectAll();
+        _keyboardGuard.Start();
     }
+
+    // Keeps the keys with the search window while an Office document is on show (see KeepKeyboard).
+    private readonly DispatcherTimer _keyboardGuard = new() { Interval = TimeSpan.FromMilliseconds(200) };
 
     public void HideSearch()
     {
         _searchCts?.Cancel();
+        _keyboardGuard.Stop();
         if (!_noticeSticky) Notice.IsVisible = false;
         Hide();
         // Page renders are a few MB each; don't keep them while hidden.
@@ -422,7 +431,8 @@ public partial class SearchWindow : Window
         for (int c = 0; c <= sheet.ColumnCount; c++) SheetGrid.ColumnDefinitions.Add(new ColumnDefinition(GridLength.Auto));
         for (int r = 0; r <= sheet.Rows.Count; r++) SheetGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
 
-        void Cell(int row, int col, string value, IBrush? background, IBrush foreground, bool right = false)
+        Control? focusCell = null;
+        Border Cell(int row, int col, string value, IBrush? background, IBrush foreground, bool right = false)
         {
             var cell = new Border
             {
@@ -440,24 +450,31 @@ public partial class SearchWindow : Window
             Grid.SetRow(cell, row);
             Grid.SetColumn(cell, col);
             SheetGrid.Children.Add(cell);
+            return cell;
         }
 
+        var currentRow = new SolidColorBrush(Color.Parse("#FFF3E0"));
         Cell(0, 0, "", headBrush, dim);
         for (int c = 0; c < sheet.ColumnCount; c++) Cell(0, c + 1, SheetPreview.ColumnName(c), headBrush, dim);
         for (int r = 0; r < sheet.Rows.Count; r++)
         {
-            Cell(r + 1, 0, sheet.RowNumbers[r].ToString(), headBrush, dim, right: true);
+            bool isCurrent = r == sheet.Current;
+            Cell(r + 1, 0, (isCurrent ? "▶ " : "") + sheet.RowNumbers[r], isCurrent ? CurrentTextHit : headBrush, isCurrent ? text : dim, right: true);
             for (int c = 0; c < sheet.ColumnCount; c++)
             {
                 var v = sheet.Rows[r][c];
                 bool hit = v.Length > 0 && terms.Any(t => v.Contains(t, StringComparison.OrdinalIgnoreCase));
                 bool number = v.Length > 0 && double.TryParse(v, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _);
-                Cell(r + 1, c + 1, v, hit ? hitBrush : Brushes.White, text, number);
+                bool current = r == sheet.Current;
+                var cell = Cell(r + 1, c + 1, v, hit ? (current ? CurrentTextHit : hitBrush) : current ? currentRow : Brushes.White, text, number);
+                if (hit && current) focusCell ??= cell;
             }
         }
         SheetLabel.Text = sheet.SheetCount > 1 ? $"工作表「{sheet.SheetName}」（共 {sheet.SheetCount} 个）" : $"工作表「{sheet.SheetName}」";
         SheetFrame.IsVisible = true;
         IconPanel.IsVisible = false;
+        // The matching cell may be far to the right: scroll the sheet sideways to it.
+        if (focusCell != null) Dispatcher.UIThread.Post(() => focusCell.BringIntoView(), DispatcherPriority.Background);
     }
 
     // ---------------------------------------------------------------- text files
@@ -548,12 +565,14 @@ public partial class SearchWindow : Window
         PageImage.Width = HitLayer.Width = w;
         PageImage.Height = HitLayer.Height = h;
         var brush = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "PageHitBrush") ?? Brushes.Yellow;
-        foreach (var hit in img.Highlights)
+        _marks.Clear();
+        foreach (var hit in img.Highlights.OrderBy(b => Math.Round(b.Y, 3)).ThenBy(b => b.X))
         {
             var mark = new Rectangle { Width = hit.Width * w + 4, Height = hit.Height * h + 4, Fill = brush, RadiusX = 2, RadiusY = 2 };
             Canvas.SetLeft(mark, hit.X * w - 2);
             Canvas.SetTop(mark, hit.Y * h - 2);
             HitLayer.Children.Add(mark);
+            _marks.Add(mark);
         }
         PageFrame.IsVisible = true;
         IconPanel.IsVisible = false;
@@ -571,11 +590,70 @@ public partial class SearchWindow : Window
     /// <summary>Brings the n-th marked word of the page (top to bottom) into view, a little below the top edge.</summary>
     private void ScrollToHighlight(int n)
     {
-        if (_preview is not { Highlights.Count: > 0 } img) return;
-        var boxes = img.Highlights.OrderBy(b => Math.Round(b.Y, 3)).ThenBy(b => b.X).ToList();
-        double y = boxes[Math.Clamp(n, 0, boxes.Count - 1)].Y * PageImage.Height;
+        if (_marks.Count == 0) return;
+        var current = _marks[Math.Clamp(n, 0, _marks.Count - 1)];
+        // The hit Ctrl+↑/↓ moved to stands out from the others, and a ring closes in on it.
+        var brush = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "PageHitBrush") ?? Brushes.Yellow;
+        foreach (var m in _marks) m.Fill = m == current ? CurrentPageHit : brush;
+        RingAround(current);
+        double y = Canvas.GetTop(current);
         Dispatcher.UIThread.Post(() => PreviewScroll.Offset = new Vector(0, Math.Max(0, PageFrame.Bounds.Y + y - 60)), DispatcherPriority.Background);
     }
+
+    private readonly List<Rectangle> _marks = new();
+    private static readonly IBrush CurrentPageHit = new SolidColorBrush(Color.Parse("#8CFF9500"));
+    private static readonly IBrush CurrentTextHit = new SolidColorBrush(Color.Parse("#FFFF9F0A"));
+    private static readonly IBrush FocusRing = new SolidColorBrush(Color.Parse("#FF9500"));
+    private Rectangle? _ring;
+    private DispatcherTimer? _ringTimer;
+
+    /// <summary>A ring that shrinks onto the mark in a third of a second: shows where the focus went.</summary>
+    private void RingAround(Rectangle mark)
+    {
+        var ring = _ring ??= new Rectangle { Stroke = FocusRing, StrokeThickness = 2.5, RadiusX = 4, RadiusY = 4, IsHitTestVisible = false };
+        if (!HitLayer.Children.Contains(ring)) HitLayer.Children.Add(ring);
+        double x = Canvas.GetLeft(mark), y = Canvas.GetTop(mark), w = mark.Width, h = mark.Height;
+        var started = DateTime.UtcNow;
+        _ringTimer?.Stop();
+        var timer = _ringTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        void Frame()
+        {
+            double t = Math.Min(1, (DateTime.UtcNow - started).TotalMilliseconds / 320);
+            double pad = 3 + 22 * (1 - t) * (1 - t);
+            ring.Width = w + 2 * pad;
+            ring.Height = h + 2 * pad;
+            Canvas.SetLeft(ring, x - pad);
+            Canvas.SetTop(ring, y - pad);
+            ring.Opacity = 0.35 + 0.65 * t;
+            if (t >= 1) timer.Stop();
+        }
+        timer.Tick += (_, _) => Frame();
+        Frame();
+        timer.Start();
+    }
+
+    private DispatcherTimer? _flashTimer;
+
+    /// <summary>Makes the "第 n 处" line light up briefly, so a step is noticed even when the view barely moves.</summary>
+    private void FlashHitInfo(string? text = null)
+    {
+        if (text != null) HitInfo.Text = text;
+        HitInfo.Foreground = FocusRing;
+        HitInfo.FontWeight = FontWeight.SemiBold;
+        _flashTimer?.Stop();
+        _flashTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(700) };
+        _flashTimer.Tick += (_, _) =>
+        {
+            _flashTimer?.Stop();
+            HitInfo.ClearValue(TextBlock.FontWeightProperty);
+            HitInfo.Foreground = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "TextSecondary");
+        };
+        _flashTimer.Start();
+    }
+
+    /// <summary>Ctrl+↑ on the first hit or Ctrl+↓ on the last: say so instead of doing nothing.</summary>
+    private void NoMoreHits(int step) =>
+        FlashHitInfo(step > 0 ? "已经是最后一处命中" : "已经是第一处命中");
 
     // ---------------------------------------------------------------- hit to hit (Ctrl+↑/↓)
 
@@ -597,19 +675,20 @@ public partial class SearchWindow : Window
 
     private void StepHit(int step)
     {
-        if (Results.SelectedItem is not ResultItem item || !item.Result.ContentMatch) return;
+        if (Results.SelectedItem is not ResultItem item) return;
+        if (!item.Result.ContentMatch) { FlashHitInfo("只有文件名匹配，文件内没有可切换的命中"); return; }
         var r = item.Result;
         if (_text != null && _previewItem == item)
         {
             int next = _hitIndex + step;
-            if (next < 0 || next >= _textHits.Count) return;
+            if (next < 0 || next >= _textHits.Count) { NoMoreHits(step); return; }
             _hitIndex = next;
             ShowTextWindow();
         }
         else if (r.Kind == FileKind.Pdf && r.HitPages is { Count: > 0 } pages)
         {
             int next = _hitIndex + step;
-            if (next < 0 || next >= pages.Count) return;
+            if (next < 0 || next >= pages.Count) { NoMoreHits(step); return; }
             _hitIndex = next;
             int page = pages[next];
             int box = next - pages.ToList().IndexOf(page); // which hit on that page
@@ -624,7 +703,10 @@ public partial class SearchWindow : Window
         else if (SheetPreview.CanPreview(r.Path))
         {
             int next = _hitIndex + step;
-            if (next < 0) return;
+            if (next < 0) { NoMoreHits(step); return; }
+            if (_sheetBusy) return; // still reading for the previous press
+            _sheetBusy = true;
+            HitInfo.Text = "正在查找…";
             var terms = TextTokenizer.QueryTerms(_lastQuery);
             var path = r.Path;
             _ = Task.Run(() =>
@@ -634,29 +716,36 @@ public partial class SearchWindow : Window
                 catch (Exception) { sheet = null; }
                 Dispatcher.UIThread.Post(() =>
                 {
-                    if (sheet == null || Results.SelectedItem != item) return; // no further matching row
+                    _sheetBusy = false;
+                    if (Results.SelectedItem != item) return;
+                    if (sheet == null || sheet.Current < 0) { UpdateHitInfo(item); NoMoreHits(step); return; }
                     _hitIndex = next;
                     ShowSheet(sheet, terms);
                     UpdateHitInfo(item);
+                    FlashHitInfo();
                 });
             });
             return;
         }
-        else return;
+        else { FlashHitInfo("这种文件的预览不能逐处切换，按 Enter 打开后查看"); return; }
         UpdateHitInfo(item);
+        FlashHitInfo();
     }
+
+    private bool _sheetBusy;
 
     private void ShowTextWindow()
     {
         if (_text == null) return;
         int at = _hitIndex < _textHits.Count ? _textHits[_hitIndex] : -1;
-        PreviewText.Inlines = Highlight(PagePreview.TextWindow(_text, at), _lastQuery);
+        PreviewText.Inlines = Highlight(PagePreview.TextWindow(_text, at, out int local), _lastQuery, local);
         PreviewScroll.Offset = default;
     }
 
     private void ClearPreviewImage()
     {
         HitLayer.Children.Clear();
+        _marks.Clear();
         PageImage.Source = null;
         PageFrame.IsVisible = false;
         PageNav.IsVisible = false;
@@ -675,7 +764,7 @@ public partial class SearchWindow : Window
     }
 
     /// <summary>Bolds every occurrence of the query terms inside the snippet.</summary>
-    private static InlineCollection Highlight(string text, string query)
+    private static InlineCollection Highlight(string text, string query, int current = -1)
     {
         var inlines = new InlineCollection();
         var terms = TextTokenizer.QueryTerms(query).Where(t => t.Length > 0).ToList();
@@ -690,7 +779,10 @@ public partial class SearchWindow : Window
             }
             if (best < 0) { inlines.Add(new Run(text[i..])); break; }
             if (best > i) inlines.Add(new Run(text[i..best]));
-            inlines.Add(new Run(text.Substring(best, len)) { FontWeight = FontWeight.Bold, Background = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "HighlightBrush") });
+            // The occurrence Ctrl+↑/↓ is on: solid orange; the others: light yellow.
+            inlines.Add(best == current
+                ? new Run(text.Substring(best, len)) { FontWeight = FontWeight.Bold, Background = CurrentTextHit, Foreground = Brushes.Black }
+                : new Run(text.Substring(best, len)) { FontWeight = FontWeight.Bold, Background = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "HighlightBrush") });
             i = best + len;
         }
         return inlines;
@@ -730,6 +822,11 @@ public partial class SearchWindow : Window
                 TurnPage(+1); e.Handled = true; break;
             case Key.Left when ctrl && PageNav.IsVisible:
                 TurnPage(-1); e.Handled = true; break;
+            // No pages to turn (text, spreadsheets): Ctrl+←/→ step through the hits like Ctrl+↑/↓.
+            case Key.Right when ctrl && Results.SelectedItem is ResultItem { Result.ContentMatch: true }:
+                StepHit(+1); e.Handled = true; break;
+            case Key.Left when ctrl && Results.SelectedItem is ResultItem { Result.ContentMatch: true }:
+                StepHit(-1); e.Handled = true; break;
             case Key.C when ctrl && e.KeyModifiers.HasFlag(KeyModifiers.Shift):
                 if (Results.SelectedItem is ResultItem it) _ = Clipboard?.SetTextAsync(it.Result.Kind == FileKind.Calculator ? it.Result.Value : it.Result.Path);
                 e.Handled = true;

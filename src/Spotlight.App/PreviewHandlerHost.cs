@@ -86,6 +86,39 @@ internal sealed class PreviewHandlerHost : NativeControlHost
         if (topLevel != IntPtr.Zero) SetFocus(topLevel);
     }
 
+    /// <summary>
+    /// While a document is on show, Office's previewer takes the keyboard focus again whenever it
+    /// likes (after drawing, after a click into it). Then ↑/↓ and Ctrl+arrows went to Word instead
+    /// of the result list. Called every few hundred ms: if the focus is on a window inside ours that
+    /// is not ours, takes it back. Returns true when it did.
+    /// </summary>
+    public static bool KeepKeyboard(IntPtr topLevel)
+    {
+        if (topLevel == IntPtr.Zero || GetForegroundWindow() != topLevel) return false;
+        var info = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+        if (!GetGUIThreadInfo(GetWindowThreadProcessId(topLevel, out _), ref info)) return false;
+        var focus = info.hwndFocus;
+        if (focus == IntPtr.Zero || focus == topLevel || GetAncestor(focus, 2 /* GA_ROOT */) != topLevel) return false;
+        uint me = GetCurrentThreadId(), owner = GetWindowThreadProcessId(focus, out _);
+        bool attached = owner != me && AttachThreadInput(me, owner, true);
+        SetFocus(topLevel);
+        if (attached) AttachThreadInput(me, owner, false);
+        return true;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GUITHREADINFO
+    {
+        public int cbSize;
+        public uint flags;
+        public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+        public RECT rcCaret;
+    }
+
+    [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint process);
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint to, bool on);
+
     /// <summary>One file on show: a single-threaded-apartment thread that owns the handler and runs a
     /// message loop for it until closed.</summary>
     private sealed class PreviewSession
