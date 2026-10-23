@@ -123,6 +123,9 @@ public sealed class Settings
 
     public bool IndexHiddenFiles { get; set; } = false;
 
+    /// <summary>"模糊匹配" in the search window: several words find files holding any of them.</summary>
+    public bool MatchAnyTerm { get; set; }
+
     public int MaxResults { get; set; } = 60;
 
     [JsonIgnore] public string? FilePath { get; private set; }

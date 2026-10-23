@@ -48,7 +48,9 @@ public partial class SearchWindow : Window
     private SortBy _sort = SortBy.Relevance;
     private bool _descending = true;
 
-    private SearchFilter CurrentFilter() => new(KindFilters[_kindIndex].kinds, _sort, _descending);
+    private SearchFilter CurrentFilter() => new(KindFilters[_kindIndex].kinds, _sort, _descending, _settings.MatchAnyTerm);
+
+    private Button? _fuzzyButton;
 
     private void BuildFilterBar()
     {
@@ -60,6 +62,14 @@ public partial class SearchWindow : Window
             _kindButtons.Add(b);
             KindChips.Children.Add(b);
         }
+        // "模糊匹配": several words find files holding any of them (normally all are needed).
+        // A checkbox look and a divider, so it does not read as one more file type.
+        SortChips.Children.Insert(0, new Border { Width = 1, Height = 16, Margin = new Thickness(10, 0, 6, 0), VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center,
+            Background = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "DividerBrush") });
+        _fuzzyButton = new Button { Content = "☐ 模糊", Classes = { "chip" }, Margin = new Thickness(0, 0, 8, 0) };
+        ToolTip.SetTip(_fuzzyButton, "开启后，输入多个关键词时只要命中其中一个就会列出，命中越多排得越前（Ctrl+M）");
+        _fuzzyButton.Click += (_, _) => ToggleFuzzy();
+        SortChips.Children.Insert(1, _fuzzyButton);
         foreach (var (label, sort) in SortOptions)
         {
             var b = new Button { Content = label, Classes = { "chip" }, Tag = label };
@@ -84,8 +94,21 @@ public partial class SearchWindow : Window
         QueueSearch();
     }
 
+    private void ToggleFuzzy()
+    {
+        _settings.MatchAnyTerm = !_settings.MatchAnyTerm;
+        try { _settings.Save(); } catch (Exception) { }
+        RefreshChips();
+        QueueSearch();
+    }
+
     private void RefreshChips()
     {
+        if (_fuzzyButton != null)
+        {
+            _fuzzyButton.Classes.Set("on", _settings.MatchAnyTerm);
+            _fuzzyButton.Content = _settings.MatchAnyTerm ? "☑ 模糊" : "☐ 模糊";
+        }
         for (int i = 0; i < _kindButtons.Count; i++) _kindButtons[i].Classes.Set("on", i == _kindIndex);
         for (int i = 0; i < _sortButtons.Count; i++)
         {
@@ -193,6 +216,7 @@ public partial class SearchWindow : Window
     {
         _searchCts?.Cancel();
         _keyboardGuard.Stop();
+        _openWhenReady = null;
         if (!_noticeSticky) Notice.IsVisible = false;
         Hide();
         // Page renders are a few MB each; don't keep them while hidden.
@@ -249,13 +273,25 @@ public partial class SearchWindow : Window
         Task.Delay(40, cts.Token).ContinueWith(_ =>
         {
             SearchResults results;
-            try { results = _engine.Search(query, filter, _settings.MaxResults, cts.Token); }
+            bool loosened = false;
+            try
+            {
+                results = _engine.Search(query, filter, _settings.MaxResults, cts.Token);
+                // Nothing holds every word: show what holds some of them rather than an empty window.
+                if (results.Count == 0 && !filter.AnyTerm && TextTokenizer.QueryTerms(query).Count > 1)
+                {
+                    results = _engine.Search(query, filter with { AnyTerm = true }, _settings.MaxResults, cts.Token);
+                    loosened = results.Count > 0;
+                }
+            }
             catch (OperationCanceledException) { return; }
             Dispatcher.UIThread.Post(() =>
             {
                 if (cts.IsCancellationRequested) return;
                 _lastQuery = query;
                 ShowResults(results);
+                if (loosened) ResultCount.Text = $"没有同时含全部关键词的，以下 {results.Total:N0} 项含其中部分";
+                if (_openWhenReady is { } reveal) { _openWhenReady = null; OpenSelected(reveal); }
             });
         }, cts.Token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
     }
@@ -817,7 +853,14 @@ public partial class SearchWindow : Window
             case Key.PageUp:
                 Move(-8); e.Handled = true; break;
             case Key.Enter:
-                OpenSelected(reveal: ctrl); e.Handled = true; break;
+                // Typed and pressed Enter at once: the list still shows the previous query's results
+                // (or none). Open the first result for what was typed as soon as it arrives.
+                if ((Query.Text ?? "").Trim() != _lastQuery.Trim() && !string.IsNullOrWhiteSpace(Query.Text)) _openWhenReady = ctrl;
+                else OpenSelected(reveal: ctrl);
+                e.Handled = true;
+                break;
+            case Key.M when ctrl:
+                ToggleFuzzy(); e.Handled = true; break;
             case Key.Right when ctrl && PageNav.IsVisible:
                 TurnPage(+1); e.Handled = true; break;
             case Key.Left when ctrl && PageNav.IsVisible:
@@ -833,6 +876,8 @@ public partial class SearchWindow : Window
                 break;
         }
     }
+
+    private bool? _openWhenReady;
 
     private void Move(int delta)
     {

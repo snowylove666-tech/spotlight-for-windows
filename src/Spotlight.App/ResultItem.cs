@@ -43,11 +43,16 @@ public sealed class ResultItem : INotifyPropertyChanged
         get
         {
             if (Result.Kind == FileKind.Calculator) return "按 Enter 复制结果";
-            if (Result.ContentMatch && Result.Snippet != null) return Where + Result.Snippet;
+            if (Result.ContentMatch && Result.Snippet != null) return Partial + Where + Result.Snippet;
             var parent = Path.GetFileName(Path.GetDirectoryName(Result.Path)) ?? "";
-            return $"{FileKinds.DisplayName(Result.Kind)} · {parent}";
+            return Partial + $"{FileKinds.DisplayName(Result.Kind)} · {parent}";
         }
     }
+
+    /// <summary>"模糊匹配": "含 2/3 个词 · " when not every word was found.</summary>
+    private string Partial =>
+        Result.TermsTotal > 1 && Result.TermsMatched > 0 && Result.TermsMatched < Result.TermsTotal
+            ? $"含 {Result.TermsMatched}/{Result.TermsTotal} 个词 · " : "";
 
     /// <summary>"第 496 页等 11 处：" in front of a content snippet.</summary>
     private string Where

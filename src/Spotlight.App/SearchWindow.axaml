@@ -199,7 +199,7 @@
         <Grid ColumnDefinitions="*,Auto">
           <TextBlock x:Name="Status" FontSize="11" Foreground="{DynamicResource TextSecondary}" TextTrimming="CharacterEllipsis" />
           <TextBlock Grid.Column="1" FontSize="11" Foreground="{DynamicResource TextSecondary}"
-                     Text="↵ 打开   Ctrl+↵ 打开位置   Tab 切换类型   Ctrl+←/→ 翻页   Ctrl+↑/↓ 上/下一处   Esc 关闭" />
+                     Text="↵ 打开   Ctrl+↵ 打开位置   Tab 切换类型   Ctrl+←/→ 翻页   Ctrl+↑/↓ 上/下一处   Ctrl+M 模糊匹配   Esc 关闭" />
         </Grid>
       </Border>
     </StackPanel>

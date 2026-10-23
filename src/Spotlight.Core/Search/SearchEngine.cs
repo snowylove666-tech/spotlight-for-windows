@@ -23,6 +23,9 @@ public sealed class SearchResult
     public int HitCount { get; set; }
     /// <summary>PDFs: the page of each occurrence, in reading order (for stepping from hit to hit).</summary>
     public IReadOnlyList<int>? HitPages { get; set; }
+    /// <summary>With "模糊匹配": how many of the query's words this result contains (in its name or text).</summary>
+    public int TermsMatched { get; set; }
+    public int TermsTotal { get; set; }
     /// <summary>A document whose text has not been read yet (so a content search can't find it yet).</summary>
     public bool ContentPending { get; init; }
     internal int ContentChars { get; init; }
@@ -46,7 +49,9 @@ public sealed class SearchResults : List<SearchResult>
 public enum SortBy { Relevance, Modified, Name, Size, Kind }
 
 /// <summary>Optional narrowing and ordering chosen in the search window.</summary>
-public sealed record SearchFilter(IReadOnlyCollection<FileKind>? Kinds = null, SortBy Sort = SortBy.Relevance, bool Descending = true)
+/// <param name="AnyTerm">"模糊匹配": several words match a file holding any of them; files holding more rank higher.</param>
+public sealed record SearchFilter(IReadOnlyCollection<FileKind>? Kinds = null, SortBy Sort = SortBy.Relevance, bool Descending = true,
+    bool AnyTerm = false)
 {
     public static SearchFilter None { get; } = new();
 
@@ -90,9 +95,10 @@ public sealed class SearchEngine : IDisposable
             return results;
         }
 
-        var fts = TextTokenizer.ToFtsQuery(query);
-        if (fts == null) return results;
         var terms = TextTokenizer.QueryTerms(query);
+        bool any = filter.AnyTerm && terms.Count > 1;
+        var fts = TextTokenizer.ToFtsQuery(query, any);
+        if (fts == null) return results;
         string qLower = query.ToLowerInvariant();
 
         lock (_lock)
@@ -115,6 +121,7 @@ public sealed class SearchEngine : IDisposable
             foreach (var r in byId.Values)
             {
                 r.Score = NameScore(r, qLower, terms);
+                if (any && r.Score <= 200) r.Score = AnyTermNameScore(r, terms);
                 r.NameMatch = r.Score > 0;
             }
 
@@ -127,6 +134,7 @@ public sealed class SearchEngine : IDisposable
                 capped |= hits.Count >= 1000;
                 foreach (var r in LoadRows(hits.Select(h => h.id).Where(id => !byId.ContainsKey(id)))) byId[r.Id] = r;
                 var scores = ContentScores(hits, byId, terms.Count == 1 ? fts : null);
+                if (any) WeighByWordsFound(hits, scores, terms, byId);
                 for (int i = 0; i < hits.Count; i++)
                 {
                     if (!byId.TryGetValue(hits[i].id, out var r)) continue;
@@ -156,6 +164,12 @@ public sealed class SearchEngine : IDisposable
                 : Order(ranked.Take(Math.Max(limit, 300)), filter).Take(limit).ToList();
 
             foreach (var r in top.Where(r => r.ContentMatch)) FillHit(r, terms);
+            if (any)
+                foreach (var r in top)
+                {
+                    r.TermsTotal = terms.Count;
+                    r.TermsMatched = Math.Max(r.TermsMatched, WordsIn(r.Name, terms));
+                }
             results.AddRange(top);
             results.Total = byId.Values.Count(r => r.Score > 0 && (filter.Kinds == null || filter.Kinds.Contains(r.Kind)));
             results.AtLeast = capped;
@@ -267,6 +281,36 @@ public sealed class SearchEngine : IDisposable
                     // Below a name holding every term, above most text-only hits.
                     r.Score = Math.Max(r.Score, 380);
                 }
+        }
+    }
+
+    /// <summary>"模糊匹配", a name holding some of the words: more words, higher (all of them scores as usual).</summary>
+    private static double AnyTermNameScore(SearchResult r, List<string> terms)
+    {
+        int found = WordsIn(r.Name, terms);
+        return found == 0 ? 0 : 200 + 200.0 * found / terms.Count;
+    }
+
+    private static int WordsIn(string text, List<string> terms) =>
+        terms.Count(t => text.Contains(t, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>"模糊匹配": a document holding three of three words comes before one holding one of three.</summary>
+    private void WeighByWordsFound(List<(long id, double bm25)> hits, double[] scores, List<string> terms, Dictionary<long, SearchResult> byId)
+    {
+        var found = new Dictionary<long, int>();
+        foreach (var t in terms)
+        {
+            var one = TextTokenizer.ToFtsQuery(t);
+            if (one == null) continue;
+            foreach (var chunk in hits.Select(h => h.id).Chunk(500))
+                foreach (var id in QueryIds($"SELECT rowid FROM content_fts WHERE content_fts MATCH $q AND rowid IN ({string.Join(',', chunk)});", ("$q", one)))
+                    found[id] = found.GetValueOrDefault(id) + 1;
+        }
+        for (int i = 0; i < hits.Count; i++)
+        {
+            int k = found.GetValueOrDefault(hits[i].id, 1);
+            scores[i] = scores[i] * (0.45 + 0.55 * k / terms.Count) + (k == terms.Count ? 60 : 0);
+            if (byId.TryGetValue(hits[i].id, out var r)) r.TermsMatched = Math.Max(r.TermsMatched, k);
         }
     }
 

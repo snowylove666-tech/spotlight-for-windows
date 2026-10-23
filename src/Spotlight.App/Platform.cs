@@ -11,6 +11,7 @@ internal static partial class Platform
 
     public static void Open(string path)
     {
+        LetNextWindowComeForward();
         if (OperatingSystem.IsWindows()) Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
         else Process.Start("xdg-open", path);
     }
@@ -21,6 +22,7 @@ internal static partial class Platform
     public static void OpenAt(string path, int? page, string? term)
     {
         if (!OperatingSystem.IsWindows()) { Open(path); return; }
+        LetNextWindowComeForward();
         var ext = Path.GetExtension(path).ToLowerInvariant();
         var exe = DefaultProgram(ext);
         var app = exe == null ? "" : Path.GetFileNameWithoutExtension(exe).ToLowerInvariant();
@@ -113,6 +115,7 @@ internal static partial class Platform
 
     public static void Reveal(string path)
     {
+        LetNextWindowComeForward();
         if (OperatingSystem.IsWindows()) Process.Start("explorer.exe", $"/select,\"{path}\"");
         else Process.Start("xdg-open", Path.GetDirectoryName(path) ?? path);
     }
@@ -177,6 +180,21 @@ internal static partial class Platform
     [LibraryImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool SetForegroundWindow(IntPtr hWnd);
+
+    [LibraryImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static partial bool AllowSetForegroundWindow(int processId);
+
+    /// <summary>
+    /// Enter / Ctrl+Enter "did nothing" when the program was already running (Explorer, Word, a PDF
+    /// reader reusing its window): the request went to that process, which Windows does not let
+    /// take the foreground, so its window opened behind the others. While we are in front we may
+    /// pass that right on to whoever opens the file.
+    /// </summary>
+    private static void LetNextWindowComeForward()
+    {
+        if (OperatingSystem.IsWindows()) AllowSetForegroundWindow(-1 /* ASFW_ANY */);
+    }
 
     /// <summary>Brings our window to the front. Windows allows this right after our hotkey fired.</summary>
     public static void ForceForeground(IntPtr hwnd)

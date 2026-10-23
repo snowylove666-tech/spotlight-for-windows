@@ -132,7 +132,8 @@ public static class TextTokenizer
     /// <summary>Builds an FTS5 MATCH expression requiring every term. The last Latin term is a
     /// prefix match (the user is probably still typing it); earlier ones are too, which keeps
     /// "ann rep" matching "annual_report". Returns null when the query has nothing searchable.</summary>
-    public static string? ToFtsQuery(string query)
+    /// <param name="anyTerm">"模糊匹配": a document needs only one of the words, not all of them.</param>
+    public static string? ToFtsQuery(string query, bool anyTerm = false)
     {
         var terms = QueryTerms(query);
         if (terms.Count == 0) return null;
@@ -151,7 +152,7 @@ public static class TextTokenizer
             }
             else parts.Add(Quote(t) + "*");
         }
-        return string.Join(" AND ", parts);
+        return string.Join(anyTerm ? " OR " : " AND ", parts);
     }
 
     private static string Quote(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
