@@ -463,6 +463,18 @@ public sealed class SearchEngine : IDisposable
         return d;
     }
 
+    /// <summary>The document text the index holds (null when none was read).</summary>
+    public string? GetText(long id)
+    {
+        lock (_lock)
+        {
+            using var c = _conn.CreateCommand();
+            c.CommandText = "SELECT data FROM texts WHERE id = $id;";
+            c.Parameters.AddWithValue("$id", id);
+            return c.ExecuteScalar() is byte[] data ? IndexStore.Decompress(data) : null;
+        }
+    }
+
     private void FillHit(SearchResult r, List<string> terms)
     {
         using var c = _conn.CreateCommand();

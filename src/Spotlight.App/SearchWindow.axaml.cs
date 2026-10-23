@@ -50,8 +50,6 @@ public partial class SearchWindow : Window
 
     private SearchFilter CurrentFilter() => new(KindFilters[_kindIndex].kinds, _sort, _descending, _settings.MatchAnyTerm);
 
-    private Button? _fuzzyButton;
-
     private void BuildFilterBar()
     {
         for (int i = 0; i < KindFilters.Length; i++)
@@ -62,14 +60,8 @@ public partial class SearchWindow : Window
             _kindButtons.Add(b);
             KindChips.Children.Add(b);
         }
-        // "模糊匹配": several words find files holding any of them (normally all are needed).
-        // A checkbox look and a divider, so it does not read as one more file type.
-        SortChips.Children.Insert(0, new Border { Width = 1, Height = 16, Margin = new Thickness(10, 0, 6, 0), VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center,
-            Background = (IBrush?)Application.Current?.FindResource(Application.Current.ActualThemeVariant, "DividerBrush") });
-        _fuzzyButton = new Button { Content = "☐ 模糊", Classes = { "chip" }, Margin = new Thickness(0, 0, 8, 0) };
-        ToolTip.SetTip(_fuzzyButton, "开启后，输入多个关键词时只要命中其中一个就会列出，命中越多排得越前（Ctrl+M）");
-        _fuzzyButton.Click += (_, _) => ToggleFuzzy();
-        SortChips.Children.Insert(1, _fuzzyButton);
+        // "模糊匹配" sits at the right end of the search box.
+        FuzzyBadge.Click += (_, _) => { ToggleFuzzy(); Query.Focus(); };
         foreach (var (label, sort) in SortOptions)
         {
             var b = new Button { Content = label, Classes = { "chip" }, Tag = label };
@@ -104,11 +96,7 @@ public partial class SearchWindow : Window
 
     private void RefreshChips()
     {
-        if (_fuzzyButton != null)
-        {
-            _fuzzyButton.Classes.Set("on", _settings.MatchAnyTerm);
-            _fuzzyButton.Content = _settings.MatchAnyTerm ? "☑ 模糊" : "☐ 模糊";
-        }
+        FuzzyBadge.Classes.Set("on", _settings.MatchAnyTerm);
         for (int i = 0; i < _kindButtons.Count; i++) _kindButtons[i].Classes.Set("on", i == _kindIndex);
         for (int i = 0; i < _sortButtons.Count; i++)
         {
@@ -262,6 +250,8 @@ public partial class SearchWindow : Window
         _searchCts?.Cancel();
         var cts = _searchCts = new CancellationTokenSource();
         FilterBar.IsVisible = !string.IsNullOrWhiteSpace(query);
+        // The empty window is just the search box; the key hints come with the results.
+        Footer.IsVisible = FilterBar.IsVisible;
         if (string.IsNullOrWhiteSpace(query))
         {
             _items.Clear();
@@ -353,6 +343,7 @@ public partial class SearchWindow : Window
         PreviewScroll.Offset = default;
         _hitIndex = 0;
         _text = null;
+        _textFromIndex = false;
         UpdateHitInfo(item);
         LoadPagePreview(item);
     }
@@ -703,10 +694,9 @@ public partial class SearchWindow : Window
         var r = item.Result;
         int total = _text != null ? _textHits.Count : r.HitCount;
         if (!r.ContentMatch || total <= 0) { HitInfo.Text = r.ContentMatch ? "文件名和正文都匹配" : ""; return; }
-        bool steppable = r.HitPages != null || _text != null || SheetPreview.CanPreview(r.Path);
-        HitInfo.Text = steppable
-            ? $"文件内 {total:N0} 处命中 · 第 {_hitIndex + 1} 处      Ctrl+↑↓ 切换"
-            : $"文件内 {total:N0} 处命中";
+        // Every content hit can be stepped through: where the preview itself can't (Word, PowerPoint),
+        // Ctrl+↑/↓ switches to the document's text from the index.
+        HitInfo.Text = $"文件内 {total:N0} 处命中 · 第 {_hitIndex + 1} 处{(_textFromIndex ? "（文字版）" : "")}      Ctrl+↑↓ 切换";
     }
 
     private void StepHit(int step)
@@ -763,12 +753,53 @@ public partial class SearchWindow : Window
             });
             return;
         }
-        else { FlashHitInfo("这种文件的预览不能逐处切换，按 Enter 打开后查看"); return; }
+        else { ShowIndexedText(item); return; }
         UpdateHitInfo(item);
         FlashHitInfo();
     }
 
     private bool _sheetBusy;
+    private bool _textFromIndex;
+
+    /// <summary>
+    /// Word and PowerPoint are drawn by Office's own previewer, which can't be told to go to a word.
+    /// The index holds their text, so Ctrl+↑/↓ swaps the preview for that text, at the first hit.
+    /// </summary>
+    private void ShowIndexedText(ResultItem item)
+    {
+        var id = item.Result.Id;
+        var terms = TextTokenizer.QueryTerms(_lastQuery);
+        HitInfo.Text = "正在载入文字版…";
+        _ = Task.Run(() =>
+        {
+            string? text;
+            try { text = _engine.GetText(id); }
+            catch (Exception) { text = null; }
+            var hits = text == null ? new List<int>() : SearchEngine.HitOffsets(text, terms, 5000);
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (Results.SelectedItem != item) return;
+                if (string.IsNullOrEmpty(text) || hits.Count == 0)
+                {
+                    UpdateHitInfo(item);
+                    FlashHitInfo("这个文件的正文还没读取完，暂时只能按 Enter 打开后查看");
+                    return;
+                }
+                _previewCts?.Cancel();
+                ClearPreviewImage();
+                _previewItem = item;
+                _text = text;
+                _textHits = hits;
+                _hitIndex = 0;
+                _textFromIndex = true;
+                ShowTextWindow();
+                TextFrame.IsVisible = true;
+                PreviewSnippet.IsVisible = false;
+                UpdateHitInfo(item);
+                FlashHitInfo();
+            });
+        });
+    }
 
     private void ShowTextWindow()
     {
