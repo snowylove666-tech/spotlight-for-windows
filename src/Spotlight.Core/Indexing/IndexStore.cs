@@ -144,12 +144,24 @@ public sealed class IndexStore : IDisposable
 
     // ---------------------------------------------------------------- generation
 
+    private long _gen = -1;
+
+    /// <summary>
+    /// A number above every generation in the table. gen has no index, so MAX(gen) reads the whole
+    /// files table (~150 ms, ~100 MB on 400k files); it ran for every changed file, so a burst of
+    /// changes (a download, a sync) delayed new files by minutes and kept the disk busy. Now the
+    /// table is read once and the counter goes on in memory.
+    /// </summary>
     public long NextGeneration()
     {
         lock (_lock)
         {
-            using var c = Cmd("SELECT COALESCE(MAX(gen), 0) + 1 FROM files;");
-            return Convert.ToInt64(c.ExecuteScalar());
+            if (_gen < 0)
+            {
+                using var c = Cmd("SELECT COALESCE(MAX(gen), 0) FROM files;");
+                _gen = Convert.ToInt64(c.ExecuteScalar());
+            }
+            return ++_gen;
         }
     }
 
@@ -341,6 +353,7 @@ public sealed class IndexStore : IDisposable
                 d.ExecuteNonQuery();
             }
             tx.Commit();
+            _counted = null; // many documents lost their text at once: count again
         }
         return doomed.Count;
     }
@@ -427,13 +440,21 @@ public sealed class IndexStore : IDisposable
                 CREATE TEMP TABLE IF NOT EXISTS doomed(id INTEGER PRIMARY KEY);
                 DELETE FROM doomed;
                 INSERT INTO doomed SELECT id FROM files WHERE {where};
+                """;
+            using (var pick = Cmd(sql))
+            {
+                foreach (var (k, v) in args) pick.Parameters.AddWithValue(k, v);
+                pick.ExecuteNonQuery();
+            }
+            using (var lost = Cmd("SELECT COALESCE(SUM(has_content), 0) FROM files WHERE id IN (SELECT id FROM doomed);"))
+                _withContentDelta -= Convert.ToInt64(lost.ExecuteScalar());
+            sql = """
                 DELETE FROM names_fts WHERE rowid IN (SELECT id FROM doomed);
                 DELETE FROM content_fts WHERE rowid IN (SELECT id FROM doomed);
                 DELETE FROM texts WHERE id IN (SELECT id FROM doomed);
                 DELETE FROM files WHERE id IN (SELECT id FROM doomed);
                 """;
             using var c = Cmd(sql);
-            foreach (var (k, v) in args) c.Parameters.AddWithValue(k, v);
             c.ExecuteNonQuery();
             using var n = Cmd("SELECT COUNT(*) FROM doomed;");
             int count = Convert.ToInt32(n.ExecuteScalar());
@@ -524,6 +545,13 @@ public sealed class IndexStore : IDisposable
             {
                 Run("DELETE FROM content_fts WHERE rowid = $id;", ("$id", id));
                 bool has = !string.IsNullOrWhiteSpace(raw);
+                using (var was = _conn.CreateCommand())
+                {
+                    was.Transaction = tx;
+                    was.CommandText = "SELECT has_content FROM files WHERE id = $id;";
+                    was.Parameters.AddWithValue("$id", id);
+                    _withContentDelta += (has ? 1 : 0) - Convert.ToInt64(was.ExecuteScalar() ?? 0L);
+                }
                 string text = has ? NormalizeWhitespace(raw!) : "";
                 if (has)
                 {
@@ -641,14 +669,26 @@ public sealed class IndexStore : IDisposable
         return total;
     }
 
-    public (long files, long withContent) Counts()
+    private (long files, long withContent, long inserted, long deleted, long contentDelta, DateTime at)? _counted;
+    private long _withContentDelta; // documents gaining text minus losing it, for Counts()
+
+    /// <summary>
+    /// Entries and documents with text. Counting reads the whole files table (~150 ms, ~100 MB on a
+    /// 400k-file index); the progress line asked twice a second while busy, which added up to
+    /// hundreds of GB read per hour. Between real counts (every 10 minutes at most) both numbers
+    /// follow inserts, deletes and stored text. <paramref name="exact"/> counts now (before/after a scan).
+    /// </summary>
+    public (long files, long withContent) Counts(bool exact = false)
     {
         lock (_lock)
         {
+            if (!exact && _counted is { } k && DateTime.UtcNow - k.at < TimeSpan.FromMinutes(10))
+                return (k.files + (Inserted - k.inserted) - (Deleted - k.deleted), k.withContent + (_withContentDelta - k.contentDelta));
             using var c = Cmd("SELECT COUNT(*), COALESCE(SUM(has_content), 0) FROM files;");
             using var r = c.ExecuteReader();
             r.Read();
-            return (r.GetInt64(0), r.GetInt64(1));
+            _counted = (r.GetInt64(0), r.GetInt64(1), Inserted, Deleted, _withContentDelta, DateTime.UtcNow);
+            return (_counted.Value.files, _counted.Value.withContent);
         }
     }
 

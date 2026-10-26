@@ -192,13 +192,13 @@ public sealed class Indexer : IDisposable
     private void FullScan(CancellationToken ct)
     {
         var started = DateTime.Now;
-        var (before, _) = _store.Counts();
+        var (before, _) = _store.Counts(exact: true);
         long sizeBefore = _store.SizeBytes(), insertedBefore = _store.Inserted, deletedBefore = _store.Deleted;
         long gen = _store.NextGeneration();
         foreach (var root in Roots) ScanRoot(root, gen, ct);
         // Anything not seen by this crawl is gone, outside the configured locations, or now filtered out.
         _store.DeleteOlderThan(gen);
-        var (after, _) = _store.Counts();
+        var (after, _) = _store.Counts(exact: true);
         // Each root sweeps its own stale rows as it finishes; count those too.
         LastScan = new ScanReport(started, DateTime.Now, before, after, _store.Inserted - insertedBefore, _store.Deleted - deletedBefore,
             sizeBefore, _store.SizeBytes(), Roots.Where(r => !Directory.Exists(r)).ToList(), _textDropped);

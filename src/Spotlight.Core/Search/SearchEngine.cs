@@ -112,9 +112,19 @@ public sealed class SearchEngine : IDisposable
             bool capped = nameIds.Count >= 3000;
             ids.UnionWith(nameIds);
             ids.UnionWith(QueryIds("SELECT id FROM files WHERE name_lower >= $lo AND name_lower < $hi LIMIT 300;", ("$lo", qLower), ("$hi", qLower + '￿')));
-            // Few hits: also try plain substring ("port" inside "report") which token matching can't do.
-            if (ids.Count < 50 && qLower.Length >= 2)
-                ids.UnionWith(QueryIds("SELECT id FROM files WHERE instr(name_lower, $q) > 0 LIMIT 300;", ("$q", qLower)));
+            // Plain substring anywhere in the name ("port" inside "annualreport", "2026" inside
+            // "v2026final"), like Everything; token matching alone can't do that. Used to run only when
+            // tokens found fewer than 50 names, so a name buried among many token hits went missing.
+            // A scan of every name takes ~45 ms on 400k files. Several words: each must be in the name.
+            var subTerms = terms.Count > 1 ? terms : new List<string> { qLower };
+            if (subTerms.Sum(t => t.Length) >= 2 && subTerms.Count <= 6)
+            {
+                var where = string.Join(" AND ", subTerms.Select((_, i) => $"instr(name_lower, $t{i}) > 0"));
+                var args = subTerms.Select((t, i) => ($"$t{i}", (object)t.ToLowerInvariant())).ToArray();
+                var sub = QueryIds($"SELECT id FROM files WHERE {where} LIMIT 2000;", args);
+                capped |= sub.Count >= 2000;
+                ids.UnionWith(sub);
+            }
             ct.ThrowIfCancellationRequested();
 
             foreach (var r in LoadRows(ids)) byId[r.Id] = r;
