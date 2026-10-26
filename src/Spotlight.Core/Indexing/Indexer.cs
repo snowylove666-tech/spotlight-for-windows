@@ -33,9 +33,13 @@ public sealed record IndexStatus(IndexPhase Phase, long Files, long WithContent,
 
 /// <summary>
 /// Keeps the index in sync with the disk on one low-priority background thread:
-///  1. a full crawl at start-up (cheap for unchanged files: only metadata is compared),
-///  2. FileSystemWatcher events afterwards, debounced and applied incrementally,
-///  3. content extraction for new or changed documents, paused while on battery.
+///  1. NTFS drives: the change journal (USN), read once a second from where the last read stopped,
+///     also across restarts and sleep, like Everything. A drive is crawled only the first time,
+///     when the search locations change, or when the journal no longer reaches back far enough.
+///  2. Other drives (FAT/exFAT USB sticks, network shares): a crawl at start-up and
+///     FileSystemWatcher events afterwards.
+///  3. Content extraction for new or changed documents: throttled while the user is at the
+///     computer, paused while on battery.
 /// </summary>
 public sealed class Indexer : IDisposable
 {
@@ -45,6 +49,11 @@ public sealed class Indexer : IDisposable
     private readonly ConcurrentQueue<string> _rescanRoots = new();
     private readonly AutoResetEvent _wake = new(false);
     private readonly List<FileSystemWatcher> _watchers = new();
+    // Volume root ("C:\") → its change journal, for drives that have one.
+    private readonly Dictionary<string, UsnJournal> _journals = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Drives followed through their NTFS change journal ("C:\", "D:\").</summary>
+    public IReadOnlyList<string> JournalVolumes => _journals.Keys.ToList();
     private readonly HashSet<string> _excludedNames;
     private readonly CancellationTokenSource _cts = new();
     private Thread? _thread;
@@ -126,26 +135,43 @@ public sealed class Indexer : IDisposable
         var ct = _cts.Token;
         try
         {
+            OpenJournals();
             // Watch first: files created or deleted while the (possibly long) first crawl runs are
             // applied during it (see ApplyFileChanges), instead of waiting for the next full scan.
             StartWatchers();
-            Guarded(() => { DropUnwantedText(); FullScan(ct); });
+            Guarded(() => { DropUnwantedText(); CatchUp(ct); });
+            bool busy = true;
             while (!ct.IsCancellationRequested)
             {
                 bool moreContent = true;
                 Guarded(() =>
                 {
-                    if (_fullRescanRequested) { _fullRescanRequested = false; FullScan(ct); }
+                    if (_fullRescanRequested) { _fullRescanRequested = false; FullScan(ct); busy = true; }
+                    busy |= ReadJournals(ct);
+                    busy |= !_changes.IsEmpty || !_rescanRoots.IsEmpty;
                     ApplyChanges(ct);
                     while (_rescanRoots.TryDequeue(out var root)) Rescan(root, ct);
                     ApplyChanges(ct);
-                    moreContent = ReadContents(ct);
-                    Publish(IndexPhase.Idle);
-                    _store.ReleaseMemory();
-                    Idle?.Invoke();
+                    moreContent = ReadContents(ct, out bool readAny);
+                    busy |= readAny;
+                    // Only after real work: the journal is polled every second, and trimming memory
+                    // or redrawing the status that often would cost more than the polling.
+                    if (busy)
+                    {
+                        Publish(IndexPhase.Idle);
+                        _store.ReleaseMemory();
+                        Idle?.Invoke();
+                        busy = false;
+                    }
                 });
-                // With content left to read (but paused on battery) re-check power once a minute.
-                _wake.WaitOne(moreContent ? TimeSpan.FromSeconds(60) : Timeout.InfiniteTimeSpan);
+                // Journals: look again in a second (a read with nothing new costs microseconds).
+                // Otherwise sleep until a watcher fires; with content left to read (paused on battery,
+                // or throttled) re-check once a minute.
+                var wait = _journals.Count > 0 ? TimeSpan.FromSeconds(1) : moreContent ? TimeSpan.FromSeconds(60) : Timeout.InfiniteTimeSpan;
+                // Resting between documents while the user is active: come back when the rest is over.
+                var rest = _restUntil - DateTime.UtcNow;
+                if (moreContent && rest > TimeSpan.Zero && (wait == Timeout.InfiniteTimeSpan || rest < wait)) wait = rest;
+                _wake.WaitOne(wait);
                 if (!_changes.IsEmpty) Thread.Sleep(Debounce);
             }
         }
@@ -173,9 +199,184 @@ public sealed class Indexer : IDisposable
     {
         DropUnwantedText();
         FullScan(ct);
-        while (ReadContents(ct, ignoreBattery: true) && _store.PendingContentCount() > 0) { }
+        while (ReadContents(ct, out _, ignoreBattery: true, unthrottled: true) && _store.PendingContentCount() > 0) { }
         Publish(IndexPhase.Idle);
     }
+
+    // ---------------------------------------------------------------- change journals
+
+    private void OpenJournals()
+    {
+        foreach (var volume in Roots.Select(r => Path.GetPathRoot(r)).Where(v => !string.IsNullOrEmpty(v)).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                if (UsnJournal.Open(volume!) is { } j) _journals[j.Volume] = j;
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception) { }
+        }
+    }
+
+    private UsnJournal? JournalOf(string path) =>
+        Path.GetPathRoot(path) is { Length: > 0 } v && _journals.TryGetValue(v, out var j) ? j : null;
+
+    /// <summary>What decides which files are indexed: when it changes, the drives are crawled again.</summary>
+    private string ScopeSignature() => string.Join("|",
+        string.Join(";", Roots), string.Join(";", _settings.ExcludedDirNames), string.Join(";", _settings.ExcludedPaths),
+        string.Join(";", _settings.ExcludedExtensions), string.Join(";", _settings.ExcludedKinds), _settings.IndexHiddenFiles,
+        "fid1"); // bump to crawl again after a change in what a crawl records
+
+    private (ulong journal, long usn)? Cursor(UsnJournal j) =>
+        _store.GetMeta("usn:" + j.Volume) is { } v && v.Split(':') is [var id, var usn]
+        && ulong.TryParse(id, System.Globalization.NumberStyles.HexNumber, null, out var jid) && long.TryParse(usn, out var u)
+            ? (jid, u) : null;
+
+    private void SaveCursor(UsnJournal j, long usn) => _store.SetMeta("usn:" + j.Volume, $"{j.JournalId:x}:{usn}");
+
+    /// <summary>
+    /// Start-up: drives whose journal still reaches back to where the last run stopped only replay
+    /// the changes since (seconds, even after days off); the others are crawled. Everything is
+    /// crawled when the search locations or filters changed.
+    /// </summary>
+    private void CatchUp(CancellationToken ct)
+    {
+        string scope = ScopeSignature();
+        bool sameScope = _store.GetMeta("scope") == scope;
+        var current = new List<UsnJournal>();
+        if (sameScope)
+            foreach (var j in _journals.Values)
+                if (j.Query() && Cursor(j) is { } c && c.journal == j.JournalId && c.usn >= j.FirstUsn && c.usn <= j.NextUsn)
+                    current.Add(j);
+        var stale = Roots.Where(r => JournalOf(r) is not { } j || !current.Contains(j)).ToList();
+        if (!sameScope || stale.Count == Roots.Count)
+        {
+            FullScan(ct);
+            return;
+        }
+        if (stale.Count > 0)
+        {
+            var starts = _journals.Values.Where(j => !current.Contains(j) && j.Query()).ToDictionary(j => j, j => j.NextUsn);
+            long gen = _store.NextGeneration();
+            foreach (var root in stale) ScanRoot(root, gen, ct);
+            foreach (var (j, usn) in starts) SaveCursor(j, usn);
+        }
+        ReadJournals(ct);
+    }
+
+    private DateTime _journalsReadAt;
+
+    /// <summary>A second has passed since the journals were last read: content reading steps aside.</summary>
+    private bool JournalsDue => _journals.Count > 0 && DateTime.UtcNow - _journalsReadAt > TimeSpan.FromSeconds(1);
+
+    /// <summary>Applies what the journals recorded since the last read. True if anything changed.</summary>
+    private bool ReadJournals(CancellationToken ct)
+    {
+        _journalsReadAt = DateTime.UtcNow;
+        bool any = false;
+        foreach (var j in _journals.Values)
+        {
+            if (Cursor(j) is not { } c) continue;
+            var changes = new List<UsnChange>();
+            var result = c.journal == j.JournalId ? j.Read(c.usn, changes) : UsnJournal.ReadResult.Reset;
+            if (result == UsnJournal.ReadResult.Reset)
+            {
+                // The journal was recreated or dropped what we hadn't read: crawl this drive again.
+                if (!j.Query()) continue;
+                long start = j.NextUsn, gen = _store.NextGeneration();
+                foreach (var root in Roots.Where(r => JournalOf(r) == j)) ScanRoot(root, gen, ct);
+                SaveCursor(j, start);
+                any = true;
+                continue;
+            }
+            if (result != UsnJournal.ReadResult.Ok) continue;
+            if (changes.Count > 0 && ApplyJournal(j, changes, ct)) any = true;
+            if (j.NextUsn != c.usn) SaveCursor(j, j.NextUsn);
+        }
+        return any;
+    }
+
+    private const UsnReason Relevant = UsnReason.FileCreate | UsnReason.FileDelete | UsnReason.RenameOldName | UsnReason.RenameNewName
+        | UsnReason.DataOverwrite | UsnReason.DataExtend | UsnReason.DataTruncation | UsnReason.BasicInfoChange
+        | UsnReason.HardLinkChange | UsnReason.ReparsePointChange;
+
+    /// <summary>
+    /// One batch of journal records. Each file is handled once, as it is now: opened by id for its
+    /// current path and details (or found gone). Records for places that aren't indexed (AppData,
+    /// a browser cache: most of what happens on C:) are skipped after two index lookups, without
+    /// touching the file. Returns true if the index changed.
+    /// </summary>
+    private bool ApplyJournal(UsnJournal j, List<UsnChange> changes, CancellationToken ct)
+    {
+        var order = new List<long>();
+        var last = new Dictionary<long, UsnChange>();
+        var why = new Dictionary<long, UsnReason>();
+        foreach (var c in changes)
+        {
+            if (!last.ContainsKey(c.Fid)) order.Add(c.Fid);
+            last[c.Fid] = c;
+            why[c.Fid] = why.GetValueOrDefault(c.Fid) | c.Reason;
+        }
+        bool changed = false;
+        int urgent = 0, inBatch = 0;
+        long gen = _store.NextGeneration();
+        void Flush() { if (inBatch > 0) { _store.CommitBatch(); inBatch = 0; } }
+        try
+        {
+            foreach (var fid in order)
+            {
+                ct.ThrowIfCancellationRequested();
+                if ((why[fid] & Relevant) == 0) continue;
+                var rec = last[fid];
+                if (inBatch == 0) { _store.BeginBatch(); inBatch = 1; }
+                var known = _store.FindByFid(j.Volume, fid);
+                bool inIndexedFolder = _store.FindByFid(j.Volume, rec.ParentFid) is { isDir: true };
+                if (known == null && !inIndexedFolder) continue;
+                FsEntry? now = (rec.Reason & UsnReason.FileDelete) != 0 ? null : j.Resolve(fid);
+                if (now is not { } e)
+                {
+                    if (known is { } gone) { _store.DeletePath(gone.path); changed = true; }
+                    continue;
+                }
+                bool moved = known is { } k && !k.path.Equals(e.Path, StringComparison.OrdinalIgnoreCase);
+                if (moved) { _store.DeletePath(known!.Value.path); changed = true; }
+                if (!InScope(e)) continue;
+                if (e.IsDir && (known == null || moved))
+                {
+                    // A new folder, or one moved here: index what is inside it too.
+                    Flush();
+                    ScanRoot(e.Path, gen, ct, sweep: false);
+                    changed = true;
+                    continue;
+                }
+                if (inBatch == 0) { _store.BeginBatch(); inBatch = 1; }
+                _store.Upsert(e, gen);
+                changed = true;
+                if (++inBatch > 500) Flush();
+                // A file just saved or downloaded is likely what the user searches for next.
+                if (!e.IsDir && urgent < 200 && _store.Find(e.Path) is { WantsContent: true, ContentRead: false } r)
+                {
+                    _urgent.Enqueue(r.Id);
+                    urgent++;
+                }
+            }
+        }
+        finally { Flush(); }
+        return changed;
+    }
+
+    /// <summary>Whether a file reported by the journal belongs in the index, by the crawl's rules:
+    /// under a search location, not excluded, not hidden/system, and in a folder that is indexed.</summary>
+    private bool InScope(FsEntry e)
+    {
+        if (IsExcluded(e.Path)) return false;
+        if ((e.Attributes & AttributesToSkip) != 0) return false;
+        if (e.IsDir ? _excludedNames.Contains(e.Name) : _settings.IsExcludedFile(e.Extension)) return false;
+        if (Roots.Any(r => r.Equals(e.Path, StringComparison.OrdinalIgnoreCase))) return true;
+        var parent = Path.GetDirectoryName(e.Path);
+        return parent != null && _store.Contains(parent);
+    }
+
+    private FileAttributes AttributesToSkip => _settings.IndexHiddenFiles ? FileAttributes.System : FileAttributes.System | FileAttributes.Hidden;
 
     /// <summary>File types or folders switched to name-only: drop their text and give the space back.</summary>
     private void DropUnwantedText()
@@ -195,9 +396,12 @@ public sealed class Indexer : IDisposable
         var (before, _) = _store.Counts(exact: true);
         long sizeBefore = _store.SizeBytes(), insertedBefore = _store.Inserted, deletedBefore = _store.Deleted;
         long gen = _store.NextGeneration();
+        var starts = _journals.Values.Where(j => j.Query()).ToDictionary(j => j, j => j.NextUsn);
         foreach (var root in Roots) ScanRoot(root, gen, ct);
         // Anything not seen by this crawl is gone, outside the configured locations, or now filtered out.
         _store.DeleteOlderThan(gen);
+        foreach (var (j, usn) in starts) SaveCursor(j, usn);
+        _store.SetMeta("scope", ScopeSignature());
         var (after, _) = _store.Counts(exact: true);
         // Each root sweeps its own stale rows as it finishes; count those too.
         LastScan = new ScanReport(started, DateTime.Now, before, after, _store.Inserted - insertedBefore, _store.Deleted - deletedBefore,
@@ -219,13 +423,13 @@ public sealed class Indexer : IDisposable
 
     // ---------------------------------------------------------------- crawling
 
-    private void ScanRoot(string root, long gen, CancellationToken ct)
+    private void ScanRoot(string root, long gen, CancellationToken ct, bool sweep = true)
     {
         if (!Directory.Exists(root)) return;
         Publish(IndexPhase.Scanning, root);
-        var stack = new Stack<DirectoryInfo>();
-        stack.Push(new DirectoryInfo(root));
-        var options = EnumOptions();
+        var stack = new Stack<string>();
+        stack.Push(root);
+        var skip = AttributesToSkip;
         int inBatch = 0;
         var sw = Stopwatch.StartNew();
         _store.BeginBatch();
@@ -235,19 +439,16 @@ public sealed class Indexer : IDisposable
             {
                 ct.ThrowIfCancellationRequested();
                 var dir = stack.Pop();
-                IEnumerable<FileSystemInfo> entries;
-                try { entries = dir.EnumerateFileSystemInfos("*", options); }
-                catch (Exception e) when (e is IOException or UnauthorizedAccessException) { continue; }
-
-                foreach (var e in Safe(entries))
+                foreach (var (e, isLink) in DirLister.List(dir))
                 {
-                    if (e is DirectoryInfo d)
+                    if ((e.Attributes & skip) != 0) continue;
+                    if (e.IsDir)
                     {
-                        if (_excludedNames.Contains(d.Name) || IsExcludedPath(d.FullName)) continue;
+                        if (_excludedNames.Contains(e.Name) || IsExcludedPath(e.Path)) continue;
                         // Don't follow junctions/symlinks: they create loops and duplicate trees.
-                        if (!IsLink(d)) stack.Push(d);
+                        if (!isLink) stack.Push(e.Path);
                     }
-                    else if (_settings.IsExcludedFile(e.Extension) || IsExcludedPath(e.FullName)) continue;
+                    else if (_settings.IsExcludedFile(e.Extension) || IsExcludedPath(e.Path)) continue;
                     _store.Upsert(e, gen);
                     if (++inBatch >= 2000)
                     {
@@ -260,10 +461,11 @@ public sealed class Indexer : IDisposable
                     }
                 }
             }
-            _store.Upsert(new DirectoryInfo(root), gen);
+            if (DirLister.Stat(root) is { } self) _store.Upsert(self, gen);
+            else _store.Upsert(new DirectoryInfo(root), gen);
         }
         finally { _store.CommitBatch(); }
-        _store.DeleteStale(root, gen);
+        if (sweep) _store.DeleteStale(root, gen);
     }
 
     /// <summary>True for junctions and symbolic links. Other reparse points are real folders: cloud sync
@@ -324,6 +526,7 @@ public sealed class Indexer : IDisposable
     {
         foreach (var root in Roots)
         {
+            if (JournalOf(root) != null) continue; // followed through the change journal
             try
             {
                 var w = new FileSystemWatcher(root)
@@ -399,15 +602,20 @@ public sealed class Indexer : IDisposable
     // ---------------------------------------------------------------- contents
 
     /// <summary>Extracts text for pending documents. Returns true if work remains.</summary>
-    private bool ReadContents(CancellationToken ct, bool ignoreBattery = false)
+    /// <param name="readAny">Whether any document was read.</param>
+    /// <param name="unthrottled">Tests and the CLI: don't slow down for the user.</param>
+    private bool ReadContents(CancellationToken ct, out bool readAny, bool ignoreBattery = false, bool unthrottled = false)
     {
+        readAny = false;
         if (!_settings.IndexContents) return false;
+        // Resting after a document while the user is active (see Throttle): come back later.
+        if (!unthrottled && DateTime.UtcNow < _restUntil) return true;
         _rate.Restart();
         while (!ct.IsCancellationRequested)
         {
             while (!_urgent.IsEmpty) ReadUrgent(ct);
             // File changes take priority over the (possibly long) content backlog.
-            if (!_changes.IsEmpty || !_rescanRoots.IsEmpty || _fullRescanRequested) return true;
+            if (!_changes.IsEmpty || !_rescanRoots.IsEmpty || _fullRescanRequested || JournalsDue) return true;
             bool onBattery = PowerAware.OnBattery();
             if (!ignoreBattery && _settings.PauseContentIndexingOnBattery && onBattery)
             {
@@ -415,9 +623,12 @@ public sealed class Indexer : IDisposable
                 return true;
             }
 
-            // Fast mode: plugged in with a real backlog (first run, new drive) → several normal-priority
-            // workers. Otherwise one background-priority worker, which is all day-to-day changes need.
-            int workers = _settings.FastIndexingWhenPluggedIn && !onBattery && _store.PendingContentCount() > 50
+            // Fast mode: plugged in with a real backlog (first run, new drive) and nobody at the
+            // computer → several workers. Otherwise one background-priority worker, which is all
+            // day-to-day changes need; while the user is typing or clicking it also pauses between
+            // documents (see Throttle), so reading never competes with what they are doing.
+            bool userActive = !unthrottled && UserActivity.Active;
+            int workers = _settings.FastIndexingWhenPluggedIn && !onBattery && !userActive && _store.PendingContentCount() > 50
                 ? Math.Clamp(Environment.ProcessorCount / 2, 2, 6)
                 : 1;
             FastMode = workers > 1;
@@ -432,8 +643,10 @@ public sealed class Indexer : IDisposable
             {
                 for (int i = 0; i < batch.Count && !ChangesWaiting; i++)
                 {
+                    var sw = Stopwatch.StartNew();
                     var text = ExtractSafely(batch[i], ct, out var note);
                     results[i] = (batch[i].Id, batch[i].MTime, text, note);
+                    if (userActive) { Throttle(sw.Elapsed); break; }
                 }
             }
             else
@@ -450,11 +663,21 @@ public sealed class Indexer : IDisposable
             var done = results.Where(r => r.Item1 != 0).ToList();
             _store.SetContents(done);
             _rate.Add(done.Count);
+            readAny |= done.Count > 0;
+            if (DateTime.UtcNow < _restUntil) return true;
         }
         return true;
     }
 
-    private bool ChangesWaiting => !_changes.IsEmpty || !_urgent.IsEmpty;
+    private DateTime _restUntil;
+
+    /// <summary>While the user is at the computer, rest three times as long as a document took
+    /// (at least 0.3 s, at most 5 s): reading then uses at most a quarter of one core and of the disk.
+    /// The rest is not a sleep: the journals and file changes are still handled meanwhile.</summary>
+    private void Throttle(TimeSpan took) =>
+        _restUntil = DateTime.UtcNow + TimeSpan.FromMilliseconds(Math.Clamp(took.TotalMilliseconds * 3, 300, 5000));
+
+    private bool ChangesWaiting => !_changes.IsEmpty || !_urgent.IsEmpty || JournalsDue;
 
     /// <summary>True while documents are being read with several workers.</summary>
     public bool FastMode { get; private set; }

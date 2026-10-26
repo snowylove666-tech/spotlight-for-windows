@@ -113,6 +113,65 @@ public sealed class IndexStore : IDisposable
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
             PRAGMA user_version={SchemaVersion};
             """);
+        // 0.8.0: the NTFS file id of each row, so a journal record (which names files by id) finds it.
+        bool hasFid = false;
+        using (var info = _conn.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(files);";
+            using var r = info.ExecuteReader();
+            while (r.Read()) hasFid |= r.GetString(1) == "fid";
+        }
+        if (!hasFid) Exec(_conn, "ALTER TABLE files ADD COLUMN fid INTEGER;");
+        Exec(_conn, "CREATE INDEX IF NOT EXISTS ix_files_fid ON files(fid) WHERE fid IS NOT NULL;");
+    }
+
+    // ---------------------------------------------------------------- meta
+
+    public string? GetMeta(string key)
+    {
+        lock (_lock)
+        {
+            using var c = Cmd("SELECT value FROM meta WHERE key = $k;");
+            c.Parameters.AddWithValue("$k", key);
+            return c.ExecuteScalar() as string;
+        }
+    }
+
+    public void SetMeta(string key, string? value)
+    {
+        lock (_lock)
+        {
+            using var c = Cmd(value == null ? "DELETE FROM meta WHERE key = $k;" : "INSERT OR REPLACE INTO meta(key, value) VALUES($k, $v);");
+            c.Parameters.AddWithValue("$k", key);
+            if (value != null) c.Parameters.AddWithValue("$v", value);
+            c.ExecuteNonQuery();
+        }
+    }
+
+    /// <summary>The row with this file id on the volume <paramref name="volume"/> ("C:"), if any.</summary>
+    public (string path, bool isDir)? FindByFid(string volume, long fid)
+    {
+        lock (_lock)
+        {
+            var (lo, hi) = PrefixRange(volume);
+            using var c = Cmd("SELECT path, kind FROM files WHERE fid = $f AND path >= $lo AND path < $hi LIMIT 1;");
+            c.Parameters.AddWithValue("$f", fid);
+            c.Parameters.AddWithValue("$lo", lo);
+            c.Parameters.AddWithValue("$hi", hi);
+            using var r = c.ExecuteReader();
+            return r.Read() ? (r.GetString(0), r.GetInt32(1) == (int)FileKind.Folder) : null;
+        }
+    }
+
+    /// <summary>Whether this path is indexed (a folder the journal's changes inside it are kept for).</summary>
+    public bool Contains(string path)
+    {
+        lock (_lock)
+        {
+            using var c = Cmd("SELECT 1 FROM files WHERE path = $p;");
+            c.Parameters.AddWithValue("$p", path);
+            return c.ExecuteScalar() != null;
+        }
     }
 
     // ---------------------------------------------------------------- batches
@@ -171,15 +230,23 @@ public sealed class IndexStore : IDisposable
     public void Upsert(FileSystemInfo info, long gen)
     {
         bool isDir = info is DirectoryInfo;
-        string path = info.FullName;
-        string ext = isDir ? "" : info.Extension.ToLowerInvariant();
-        long size = isDir ? 0 : ((FileInfo)info).Length;
-        long mtime = info.LastWriteTimeUtc.Ticks;
-        var kind = isDir ? FileKind.Folder : ClassifyFile(path, ext);
-        string display = DisplayName(info.Name, ext, kind);
-        bool wants = WantsContent(path, ext, size, kind) && !IsCloudOnly(info.Attributes);
+        Upsert(new FsEntry(info.FullName, info.Name, isDir, info.Attributes, isDir ? 0 : ((FileInfo)info).Length, info.LastWriteTimeUtc.Ticks, 0), gen);
+    }
 
-        using (var sel = Cmd("SELECT id, mtime, size FROM files WHERE path = $p;"))
+    /// <summary>Inserts or refreshes one entry. Must be called between BeginBatch and CommitBatch.</summary>
+    public void Upsert(FsEntry e, long gen)
+    {
+        bool isDir = e.IsDir;
+        string path = e.Path;
+        string ext = isDir ? "" : e.Extension.ToLowerInvariant();
+        long size = isDir ? 0 : e.Size;
+        long mtime = e.MTime;
+        var kind = isDir ? FileKind.Folder : ClassifyFile(path, ext);
+        string display = DisplayName(e.Name, ext, kind);
+        bool wants = WantsContent(path, ext, size, kind) && !IsCloudOnly(e.Attributes);
+        object fid = e.Fid != 0 ? e.Fid : DBNull.Value;
+
+        using (var sel = Cmd("SELECT id, mtime, size, fid FROM files WHERE path = $p;"))
         {
             sel.Parameters.AddWithValue("$p", path);
             using var r = sel.ExecuteReader();
@@ -187,14 +254,17 @@ public sealed class IndexStore : IDisposable
             {
                 long id = r.GetInt64(0);
                 bool changed = r.GetInt64(1) != mtime || r.GetInt64(2) != size;
+                bool newFid = e.Fid != 0 && (r.IsDBNull(3) || r.GetInt64(3) != e.Fid);
                 r.Close();
                 using var upd = Cmd(changed
-                    ? "UPDATE files SET gen = $g, mtime = $m, size = $s, wants_content = $w WHERE id = $id;"
+                    ? "UPDATE files SET gen = $g, mtime = $m, size = $s, wants_content = $w, fid = COALESCE($f, fid) WHERE id = $id;"
                     // wants_content is refreshed too: a cloud placeholder may have been downloaded since.
+                    : newFid ? "UPDATE files SET gen = $g, wants_content = $w, fid = $f WHERE id = $id;"
                     : "UPDATE files SET gen = $g, wants_content = $w WHERE id = $id;");
                 upd.Parameters.AddWithValue("$g", gen);
                 upd.Parameters.AddWithValue("$id", id);
                 upd.Parameters.AddWithValue("$w", wants ? 1 : 0);
+                if (changed || newFid) upd.Parameters.AddWithValue("$f", fid);
                 if (changed)
                 {
                     upd.Parameters.AddWithValue("$m", mtime);
@@ -206,10 +276,11 @@ public sealed class IndexStore : IDisposable
         }
 
         using (var ins = Cmd("""
-            INSERT INTO files(path, name, name_lower, ext, kind, size, mtime, gen, wants_content)
-            VALUES($p, $n, $nl, $e, $k, $s, $m, $g, $w) RETURNING id;
+            INSERT INTO files(path, name, name_lower, ext, kind, size, mtime, gen, wants_content, fid)
+            VALUES($p, $n, $nl, $e, $k, $s, $m, $g, $w, $f) RETURNING id;
             """))
         {
+            ins.Parameters.AddWithValue("$f", fid);
             ins.Parameters.AddWithValue("$p", path);
             ins.Parameters.AddWithValue("$n", display);
             ins.Parameters.AddWithValue("$nl", display.ToLowerInvariant());

@@ -52,7 +52,7 @@
         <TextBlock x:Name="Roots" Classes="hint" Margin="0,4,0,0" />
 
         <TextBlock Classes="h" Text="正文（按内容搜索）" />
-        <TextBlock x:Name="Content" Classes="line" />
+        <TextBlock x:Name="ContentInfo" Classes="line" />
 
         <TextBlock Classes="h" Text="不会收录的内容" />
         <TextBlock x:Name="Excluded" Classes="line" />

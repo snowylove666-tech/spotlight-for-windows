@@ -63,9 +63,16 @@ public partial class IndexStatusWindow : Window
 
         Phase.Text = s.Phase switch
         {
-            IndexPhase.Idle => "✓ 已完成，正在监视文件变化（新增、修改、删除的文件几秒内会同步）",
+            IndexPhase.Idle => "✓ 已完成，正在跟踪文件变化（新增、修改、删除的文件几秒内会同步）",
             _ => s.Describe(),
         };
+        // How changes are followed, per drive.
+        var journaled = cur.indexer.JournalVolumes.Select(v => v.TrimEnd('\\')).ToList();
+        var watched = cur.indexer.Roots.Select(r => Path.GetPathRoot(r)!.TrimEnd('\\')).Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(v => !journaled.Contains(v, StringComparer.OrdinalIgnoreCase)).ToList();
+        Phase.Text += "\n" + (journaled.Count > 0 ? $"{string.Join("、", journaled)} 用 NTFS 变更日志跟踪（和 Everything 一样；程序关闭或待机期间的变化，下次启动几秒内补上）" : "")
+            + (journaled.Count > 0 && watched.Count > 0 ? "；" : "")
+            + (watched.Count > 0 ? $"{string.Join("、", watched)} 用文件夹监视（非 NTFS 盘，启动时会重新扫描）" : "");
         Counts.Text = $"共收录 {files:N0} 个文件和文件夹，其中 {withContent:N0} 个文档可以按内容搜索"
             + (s.PendingContent > 0 ? $"，还有 {s.PendingContent:N0} 个文档的正文等待读取" : "");
         string folder = Path.GetDirectoryName(cur.store.DbPath) ?? "";
@@ -86,7 +93,7 @@ public partial class IndexStatusWindow : Window
             : $"默认（全盘）：除系统盘外的所有本地磁盘，加上开始菜单、用户文件夹（桌面、文档、下载…）和系统盘上你自己建的文件夹，共 {roots.Count} 个位置";
         Roots.Text = string.Join("\n", roots.Take(14)) + (roots.Count > 14 ? $"\n…等 {roots.Count} 个" : "");
 
-        Content.Text = !_settings.IndexContents
+        ContentInfo.Text = !_settings.IndexContents
             ? "已关闭：只按文件名搜索（设置 → 文档正文）。"
             : _settings.FullContentIndex
                 ? "完整正文索引：开启。所有类型（含代码、日志、网页）、所有文件夹都读取正文，搜得最全，索引最大。"

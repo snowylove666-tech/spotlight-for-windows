@@ -4,6 +4,6 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
-    <Version>0.7.9</Version>
+    <Version>0.8.0</Version>
   </PropertyGroup>
 </Project>
