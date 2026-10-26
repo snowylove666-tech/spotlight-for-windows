@@ -241,7 +241,36 @@ public sealed class Settings
         File.WriteAllText(FilePath, JsonSerializer.Serialize(this, JsonOptions));
     }
 
-    public IReadOnlyList<string> EffectiveRoots()
+    /// <summary>
+    /// "收录全部文件名": like Everything, every file and folder name on every local drive is indexed,
+    /// also in AppData, Windows, Program Files, node_modules, hidden folders… Those places are
+    /// name-only (no text is read) and rank below the usual results. Off by default: it adds about
+    /// a million names on a typical PC and follows every write Windows makes.
+    /// </summary>
+    public bool IndexAllNames { get; set; }
+
+    /// <summary>Never indexed, even with <see cref="IndexAllNames"/>: Windows' own bookkeeping.</summary>
+    public static readonly string[] AlwaysSkippedDirNames =
+        { "$RECYCLE.BIN", "System Volume Information", "$WinREAgent", "$Windows.~BT", "$Windows.~WS", "$SysReset", "Config.Msi" };
+
+    /// <summary>Every fixed drive, the system drive included.</summary>
+    public static IEnumerable<string> AllDrives()
+    {
+        if (!OperatingSystem.IsWindows()) return Array.Empty<string>();
+        var list = new List<string>();
+        foreach (var d in DriveInfo.GetDrives())
+        {
+            try { if (d.DriveType == DriveType.Fixed && d.IsReady) list.Add(d.RootDirectory.FullName); }
+            catch (IOException) { }
+        }
+        return list;
+    }
+
+    public IReadOnlyList<string> EffectiveRoots() =>
+        IndexAllNames ? Dedupe(AllDrives().Concat(NormalRoots())) : NormalRoots();
+
+    /// <summary>The search locations without <see cref="IndexAllNames"/>: what is indexed in full.</summary>
+    public IReadOnlyList<string> NormalRoots()
     {
         if (Roots.Count > 0) return Roots.Where(Directory.Exists).ToList();
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);

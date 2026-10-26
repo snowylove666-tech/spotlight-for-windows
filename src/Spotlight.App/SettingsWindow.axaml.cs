@@ -107,6 +107,7 @@ public partial class SettingsWindow : Window
         IndexFolderText.Text = settings.IndexFolder ?? Settings.AppDataDir;
         ContentsCheck.IsChecked = settings.IndexContents;
         FullContentCheck.IsChecked = settings.FullContentIndex;
+        AllNamesCheck.IsChecked = settings.IndexAllNames;
         FullContentCheck.IsCheckedChanged += (_, _) => UpdateContentChoices();
         ContentsCheck.IsCheckedChanged += (_, _) => UpdateContentChoices();
         UpdateContentChoices();
@@ -244,6 +245,7 @@ public partial class SettingsWindow : Window
             .Select(Settings.NormalizeExtension).Where(e => e.Length > 1).Distinct().ToList();
         _settings.IndexContents = ContentsCheck.IsChecked == true;
         _settings.FullContentIndex = FullContentCheck.IsChecked == true;
+        _settings.IndexAllNames = AllNamesCheck.IsChecked == true;
         _settings.MaxPdfFileSizeMB = (int)(PdfLimit.Value ?? 300);
         _settings.MaxContentFileSizeMB = (int)(DocLimit.Value ?? 20);
         _settings.PauseContentIndexingOnBattery = BatteryCheck.IsChecked == true;

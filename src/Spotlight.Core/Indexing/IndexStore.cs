@@ -122,6 +122,15 @@ public sealed class IndexStore : IDisposable
             while (r.Read()) hasFid |= r.GetString(1) == "fid";
         }
         if (!hasFid) Exec(_conn, "ALTER TABLE files ADD COLUMN fid INTEGER;");
+        // 0.8.1: 1 for names indexed only because of "收录全部文件名" (AppData, Windows, …): no text, ranked lower.
+        bool hasBuried = false;
+        using (var info = _conn.CreateCommand())
+        {
+            info.CommandText = "PRAGMA table_info(files);";
+            using var r = info.ExecuteReader();
+            while (r.Read()) hasBuried |= r.GetString(1) == "buried";
+        }
+        if (!hasBuried) Exec(_conn, "ALTER TABLE files ADD COLUMN buried INTEGER NOT NULL DEFAULT 0;");
         Exec(_conn, "CREATE INDEX IF NOT EXISTS ix_files_fid ON files(fid) WHERE fid IS NOT NULL;");
     }
 
@@ -164,13 +173,16 @@ public sealed class IndexStore : IDisposable
     }
 
     /// <summary>Whether this path is indexed (a folder the journal's changes inside it are kept for).</summary>
-    public bool Contains(string path)
+    public bool Contains(string path) => Buried(path) != null;
+
+    /// <summary>Null when the path isn't indexed; otherwise whether it is a name-only "all names" row.</summary>
+    public bool? Buried(string path)
     {
         lock (_lock)
         {
-            using var c = Cmd("SELECT 1 FROM files WHERE path = $p;");
+            using var c = Cmd("SELECT buried FROM files WHERE path = $p;");
             c.Parameters.AddWithValue("$p", path);
-            return c.ExecuteScalar() != null;
+            return c.ExecuteScalar() is long b ? b == 1 : null;
         }
     }
 
@@ -234,7 +246,8 @@ public sealed class IndexStore : IDisposable
     }
 
     /// <summary>Inserts or refreshes one entry. Must be called between BeginBatch and CommitBatch.</summary>
-    public void Upsert(FsEntry e, long gen)
+    /// <param name="buried">Indexed only because of "收录全部文件名": its text is never read.</param>
+    public void Upsert(FsEntry e, long gen, bool buried = false)
     {
         bool isDir = e.IsDir;
         string path = e.Path;
@@ -243,10 +256,10 @@ public sealed class IndexStore : IDisposable
         long mtime = e.MTime;
         var kind = isDir ? FileKind.Folder : ClassifyFile(path, ext);
         string display = DisplayName(e.Name, ext, kind);
-        bool wants = WantsContent(path, ext, size, kind) && !IsCloudOnly(e.Attributes);
+        bool wants = !buried && WantsContent(path, ext, size, kind) && !IsCloudOnly(e.Attributes);
         object fid = e.Fid != 0 ? e.Fid : DBNull.Value;
 
-        using (var sel = Cmd("SELECT id, mtime, size, fid FROM files WHERE path = $p;"))
+        using (var sel = Cmd("SELECT id, mtime, size, fid, buried FROM files WHERE path = $p;"))
         {
             sel.Parameters.AddWithValue("$p", path);
             using var r = sel.ExecuteReader();
@@ -255,17 +268,19 @@ public sealed class IndexStore : IDisposable
                 long id = r.GetInt64(0);
                 bool changed = r.GetInt64(1) != mtime || r.GetInt64(2) != size;
                 bool newFid = e.Fid != 0 && (r.IsDBNull(3) || r.GetInt64(3) != e.Fid);
+                bool newBuried = (r.GetInt64(4) == 1) != buried;
                 r.Close();
-                using var upd = Cmd(changed
-                    ? "UPDATE files SET gen = $g, mtime = $m, size = $s, wants_content = $w, fid = COALESCE($f, fid) WHERE id = $id;"
+                using var upd = Cmd(changed || newBuried
+                    ? "UPDATE files SET gen = $g, mtime = $m, size = $s, wants_content = $w, fid = COALESCE($f, fid), buried = $b WHERE id = $id;"
                     // wants_content is refreshed too: a cloud placeholder may have been downloaded since.
                     : newFid ? "UPDATE files SET gen = $g, wants_content = $w, fid = $f WHERE id = $id;"
                     : "UPDATE files SET gen = $g, wants_content = $w WHERE id = $id;");
+                if (changed || newBuried) upd.Parameters.AddWithValue("$b", buried ? 1 : 0);
                 upd.Parameters.AddWithValue("$g", gen);
                 upd.Parameters.AddWithValue("$id", id);
                 upd.Parameters.AddWithValue("$w", wants ? 1 : 0);
-                if (changed || newFid) upd.Parameters.AddWithValue("$f", fid);
-                if (changed)
+                if (changed || newFid || newBuried) upd.Parameters.AddWithValue("$f", fid);
+                if (changed || newBuried)
                 {
                     upd.Parameters.AddWithValue("$m", mtime);
                     upd.Parameters.AddWithValue("$s", size);
@@ -276,10 +291,11 @@ public sealed class IndexStore : IDisposable
         }
 
         using (var ins = Cmd("""
-            INSERT INTO files(path, name, name_lower, ext, kind, size, mtime, gen, wants_content, fid)
-            VALUES($p, $n, $nl, $e, $k, $s, $m, $g, $w, $f) RETURNING id;
+            INSERT INTO files(path, name, name_lower, ext, kind, size, mtime, gen, wants_content, fid, buried)
+            VALUES($p, $n, $nl, $e, $k, $s, $m, $g, $w, $f, $b) RETURNING id;
             """))
         {
+            ins.Parameters.AddWithValue("$b", buried ? 1 : 0);
             ins.Parameters.AddWithValue("$f", fid);
             ins.Parameters.AddWithValue("$p", path);
             ins.Parameters.AddWithValue("$n", display);
@@ -404,10 +420,10 @@ public sealed class IndexStore : IDisposable
         var doomed = new List<long>();
         lock (_lock)
         {
-            using (var c = Cmd("SELECT id, path, ext, size, kind FROM files WHERE wants_content = 1 OR has_content = 1 OR content_mtime <> 0;"))
+            using (var c = Cmd("SELECT id, path, ext, size, kind, buried FROM files WHERE wants_content = 1 OR has_content = 1 OR content_mtime <> 0;"))
             using (var r = c.ExecuteReader())
                 while (r.Read())
-                    if (!WantsContent(r.GetString(1), r.GetString(2), r.GetInt64(3), (FileKind)r.GetInt32(4)))
+                    if (r.GetInt64(5) == 1 || !WantsContent(r.GetString(1), r.GetString(2), r.GetInt64(3), (FileKind)r.GetInt32(4)))
                         doomed.Add(r.GetInt64(0));
             if (doomed.Count == 0) return 0;
             using var tx = _conn.BeginTransaction();

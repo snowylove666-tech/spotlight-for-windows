@@ -88,7 +88,9 @@ public partial class IndexStatusWindow : Window
 
         bool custom = _settings.Roots.Count > 0;
         var roots = cur.indexer.Roots;
-        Scope.Text = custom
+        Scope.Text = _settings.IndexAllNames
+            ? $"收录全部文件名（像 Everything）：所有本地磁盘的全部文件和文件夹，共 {roots.Count} 个磁盘。AppData、Windows、Program Files、node_modules、隐藏文件等只收录文件名，排在你自己的文件后面"
+            : custom
             ? $"自定义：{roots.Count} 个位置（设置 → 搜索位置）"
             : $"默认（全盘）：除系统盘外的所有本地磁盘，加上开始菜单、用户文件夹（桌面、文档、下载…）和系统盘上你自己建的文件夹，共 {roots.Count} 个位置";
         Roots.Text = string.Join("\n", roots.Take(14)) + (roots.Count > 14 ? $"\n…等 {roots.Count} 个" : "");
@@ -106,8 +108,13 @@ public partial class IndexStatusWindow : Window
         if (_settings.ExcludedPaths.Count > 0) ex.Add("你排除的文件夹：" + string.Join("、", _settings.ExcludedPaths));
         if (!_settings.FullContentIndex && _settings.ExcludedContentPaths.Count > 0)
             ex.Add("只收录文件名、不读正文的文件夹：" + string.Join("、", _settings.ExcludedContentPaths));
-        if (!_settings.IndexHiddenFiles) ex.Add("隐藏文件和系统文件");
-        ex.Add($"系统和程序文件夹（Windows、Program Files、AppData、node_modules 等 {_settings.ExcludedDirNames.Count} 个名称）");
+        if (_settings.IndexAllNames)
+            ex.Add("回收站、System Volume Information 等 Windows 内部文件夹");
+        else
+        {
+            if (!_settings.IndexHiddenFiles) ex.Add("隐藏文件和系统文件");
+            ex.Add($"系统和程序文件夹（Windows、Program Files、AppData、node_modules 等 {_settings.ExcludedDirNames.Count} 个名称）——在设置 → 搜索位置 打开「收录全部文件名」可以按文件名搜到它们");
+        }
         ex.Add($"超过大小上限的文档只收录文件名（PDF {_settings.MaxPdfFileSizeMB} MB，其他 {_settings.MaxContentFileSizeMB} MB）");
         ex.Add("网盘里「仅在线」、没下载到本地的文件只收录文件名");
         Excluded.Text = string.Join("\n", ex.Select(e => "· " + e));

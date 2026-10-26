@@ -55,6 +55,10 @@ public sealed class Indexer : IDisposable
     /// <summary>Drives followed through their NTFS change journal ("C:\", "D:\").</summary>
     public IReadOnlyList<string> JournalVolumes => _journals.Keys.ToList();
     private readonly HashSet<string> _excludedNames;
+    // "收录全部文件名": the folder names that are then indexed name-only instead of skipped,
+    // and the places indexed in full (everything else on the drives is name-only).
+    private readonly HashSet<string> _buriedNames;
+    private readonly IReadOnlyList<string> _normalRoots;
     private readonly CancellationTokenSource _cts = new();
     private Thread? _thread;
     private volatile bool _fullRescanRequested;
@@ -79,7 +83,9 @@ public sealed class Indexer : IDisposable
     {
         _store = store;
         _settings = settings;
-        _excludedNames = new HashSet<string>(settings.ExcludedDirNames, StringComparer.OrdinalIgnoreCase);
+        _excludedNames = new HashSet<string>(settings.IndexAllNames ? Settings.AlwaysSkippedDirNames : settings.ExcludedDirNames, StringComparer.OrdinalIgnoreCase);
+        _buriedNames = new HashSet<string>(settings.IndexAllNames ? settings.ExcludedDirNames.Except(Settings.AlwaysSkippedDirNames, StringComparer.OrdinalIgnoreCase) : Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        _normalRoots = roots ?? Settings.AppRoots().Concat(settings.NormalRoots()).ToList();
         _ownFiles = Path.GetFullPath(store.DbPath);
         Roots = roots ?? Settings.AppRoots().Concat(settings.EffectiveRoots()).ToList();
     }
@@ -223,8 +229,8 @@ public sealed class Indexer : IDisposable
     /// <summary>What decides which files are indexed: when it changes, the drives are crawled again.</summary>
     private string ScopeSignature() => string.Join("|",
         string.Join(";", Roots), string.Join(";", _settings.ExcludedDirNames), string.Join(";", _settings.ExcludedPaths),
-        string.Join(";", _settings.ExcludedExtensions), string.Join(";", _settings.ExcludedKinds), _settings.IndexHiddenFiles,
-        "fid1"); // bump to crawl again after a change in what a crawl records
+        string.Join(";", _settings.ExcludedExtensions), string.Join(";", _settings.ExcludedKinds), _settings.IndexHiddenFiles, _settings.IndexAllNames,
+        "fid2"); // bump to crawl again after a change in what a crawl records
 
     private (ulong journal, long usn)? Cursor(UsnJournal j) =>
         _store.GetMeta("usn:" + j.Volume) is { } v && v.Split(':') is [var id, var usn]
@@ -349,7 +355,7 @@ public sealed class Indexer : IDisposable
                     continue;
                 }
                 if (inBatch == 0) { _store.BeginBatch(); inBatch = 1; }
-                _store.Upsert(e, gen);
+                _store.Upsert(e, gen, IsBuried(e, Path.GetDirectoryName(e.Path) is { } p && _store.Buried(p) == true));
                 changed = true;
                 if (++inBatch > 500) Flush();
                 // A file just saved or downloaded is likely what the user searches for next.
@@ -376,7 +382,27 @@ public sealed class Indexer : IDisposable
         return parent != null && _store.Contains(parent);
     }
 
-    private FileAttributes AttributesToSkip => _settings.IndexHiddenFiles ? FileAttributes.System : FileAttributes.System | FileAttributes.Hidden;
+    private FileAttributes AttributesToSkip =>
+        _settings.IndexAllNames ? 0 : _settings.IndexHiddenFiles ? FileAttributes.System : FileAttributes.System | FileAttributes.Hidden;
+
+    /// <summary>"收录全部文件名": whether an entry is there only because of it (name-only, ranked lower):
+    /// inside a folder that would otherwise be skipped, hidden/system, or outside the usual locations.</summary>
+    private bool IsBuried(FsEntry e, bool parentBuried)
+    {
+        if (!_settings.IndexAllNames) return false;
+        // A search location itself never is, even a drive root (which Windows marks hidden + system).
+        if (IsNormalRoot(e.Path)) return false;
+        if (parentBuried && !IsNormalRoot(e.Path)) return true;
+        if (e.IsDir && _buriedNames.Contains(e.Name)) return true;
+        var hidden = _settings.IndexHiddenFiles ? FileAttributes.System : FileAttributes.System | FileAttributes.Hidden;
+        if ((e.Attributes & hidden) != 0) return true;
+        return !UnderNormalRoot(e.Path);
+    }
+
+    private bool IsNormalRoot(string path) => _normalRoots.Any(r => Path.TrimEndingDirectorySeparator(r).Equals(Path.TrimEndingDirectorySeparator(path), StringComparison.OrdinalIgnoreCase));
+
+    private bool UnderNormalRoot(string path) => _normalRoots.Any(r =>
+        path.StartsWith(Settings.WithSeparator(r), StringComparison.OrdinalIgnoreCase) || IsNormalRoot(path));
 
     /// <summary>File types or folders switched to name-only: drop their text and give the space back.</summary>
     private void DropUnwantedText()
@@ -427,8 +453,9 @@ public sealed class Indexer : IDisposable
     {
         if (!Directory.Exists(root)) return;
         Publish(IndexPhase.Scanning, root);
-        var stack = new Stack<string>();
-        stack.Push(root);
+        var stack = new Stack<(string dir, bool buried)>();
+        bool rootBuried = DirLister.Stat(root) is { } rs && IsBuried(rs, Path.GetDirectoryName(root) is { } up && _store.Buried(up) == true);
+        stack.Push((root, rootBuried));
         var skip = AttributesToSkip;
         int inBatch = 0;
         var sw = Stopwatch.StartNew();
@@ -438,18 +465,19 @@ public sealed class Indexer : IDisposable
             while (stack.Count > 0)
             {
                 ct.ThrowIfCancellationRequested();
-                var dir = stack.Pop();
+                var (dir, dirBuried) = stack.Pop();
                 foreach (var (e, isLink) in DirLister.List(dir))
                 {
                     if ((e.Attributes & skip) != 0) continue;
+                    bool buried = IsBuried(e, dirBuried);
                     if (e.IsDir)
                     {
                         if (_excludedNames.Contains(e.Name) || IsExcludedPath(e.Path)) continue;
                         // Don't follow junctions/symlinks: they create loops and duplicate trees.
-                        if (!isLink) stack.Push(e.Path);
+                        if (!isLink) stack.Push((e.Path, buried));
                     }
                     else if (_settings.IsExcludedFile(e.Extension) || IsExcludedPath(e.Path)) continue;
-                    _store.Upsert(e, gen);
+                    _store.Upsert(e, gen, buried);
                     if (++inBatch >= 2000)
                     {
                         _store.CommitBatch();
@@ -461,7 +489,7 @@ public sealed class Indexer : IDisposable
                     }
                 }
             }
-            if (DirLister.Stat(root) is { } self) _store.Upsert(self, gen);
+            if (DirLister.Stat(root) is { } self) _store.Upsert(self, gen, rootBuried);
             else _store.Upsert(new DirectoryInfo(root), gen);
         }
         finally { _store.CommitBatch(); }

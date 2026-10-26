@@ -32,6 +32,8 @@ public sealed class SearchResult
     /// <summary>For calculator results: the computed value.</summary>
     public string? Value { get; init; }
     internal int LaunchCount { get; init; }
+    /// <summary>Indexed only because of "收录全部文件名" (AppData, Windows, …).</summary>
+    public bool Buried { get; init; }
     internal long LastLaunch { get; init; }
 
     public override string ToString() => $"{Score,7:F1}  {FileKinds.DisplayName(Kind),-4} {Name}  ({Path})";
@@ -388,6 +390,9 @@ public sealed class SearchEngine : IDisposable
             b += Math.Min(300, 120 * Math.Log2(1 + r.LaunchCount) * (0.3 + 0.7 * decay));
         }
 
+        // Program internals, caches, system files: found when asked for by name, but after the user's own files.
+        if (r.Buried) b -= 300;
+
         int depth = r.Path.Count(c => c == System.IO.Path.DirectorySeparatorChar);
         b -= Math.Min(60, Math.Max(0, depth - 4) * 6);
         return b;
@@ -440,7 +445,7 @@ public sealed class SearchEngine : IDisposable
         foreach (var chunk in ids.Chunk(500))
         {
             using var c = _conn.CreateCommand();
-            c.CommandText = $"SELECT id, path, name, kind, size, mtime, launch_count, last_launch, content_chars, wants_content = 1 AND content_mtime <> mtime FROM files WHERE id IN ({string.Join(',', chunk)});";
+            c.CommandText = $"SELECT id, path, name, kind, size, mtime, launch_count, last_launch, content_chars, wants_content = 1 AND content_mtime <> mtime, buried FROM files WHERE id IN ({string.Join(',', chunk)});";
             using var r = c.ExecuteReader();
             while (r.Read())
                 list.Add(new SearchResult
@@ -455,6 +460,7 @@ public sealed class SearchEngine : IDisposable
                     LastLaunch = r.GetInt64(7),
                     ContentChars = r.GetInt32(8),
                     ContentPending = r.GetInt64(9) == 1,
+                    Buried = r.GetInt64(10) == 1,
                 });
         }
         return list;
