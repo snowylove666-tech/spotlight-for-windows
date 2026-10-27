@@ -157,7 +157,7 @@ public partial class SearchWindow : Window
         PreviewScroll.AddHandler(PointerWheelChangedEvent, OnPreviewWheel, Avalonia.Interactivity.RoutingStrategies.Tunnel);
         _keyboardGuard.Tick += (_, _) =>
         {
-            if (OperatingSystem.IsWindows() && Handler.IsVisible && PreviewHandlerHost.KeepKeyboard(TopHandle)) Query.Focus();
+            if (OperatingSystem.IsWindows() && Handler.IsEffectivelyVisible && PreviewHandlerHost.KeepKeyboard(TopHandle)) Query.Focus();
         };
         Opened += (_, _) =>
         {
@@ -282,28 +282,40 @@ public partial class SearchWindow : Window
             ShowSearching(false);
             _items.Clear();
             ResultsArea.IsVisible = false;
+            DropPreview();
             return;
         }
         var filter = CurrentFilter();
         _warmCts?.Cancel();
         _lastSearch = DateTime.UtcNow;
-        Task.Delay(400, cts.Token).ContinueWith(_ => Dispatcher.UIThread.Post(() => { if (!cts.IsCancellationRequested) ShowSearching(true); }),
+        // Where a slow search spent its time, for error.log (see Show).
+        var typed = System.Diagnostics.Stopwatch.StartNew();
+        var trace = new List<string>();
+        // "正在搜索…" while this search is still going after 0.4 s. (Set and read on the UI thread; the
+        // timer used to switch it on after a quick search had finished, and it stayed on.)
+        bool finished = false;
+        Task.Delay(400, cts.Token).ContinueWith(_ => Dispatcher.UIThread.Post(() => { if (!cts.IsCancellationRequested && !finished) ShowSearching(true); }),
             cts.Token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
         // Short debounce so fast typing doesn't run a query per keystroke. A newer keystroke cancels
         // this search, which stops its query at once (SearchEngine.InterruptOn).
         Task.Delay(40, cts.Token).ContinueWith(_ =>
         {
-            // 1. Everything but the "收录全部文件名" extras' substrings: fast, shown at once.
-            if (Run(filter with { ExtraNames = false }) is not { } first) return;
+            trace.Add($"开始 {typed.ElapsedMilliseconds}");
+            // 1. Names (not the "收录全部文件名" extras' substrings): small indexes, shown at once.
+            if (Run(filter with { ExtraNames = false, Content = false }) is not { } first) return;
+            trace.Add($"第一步完成 {typed.ElapsedMilliseconds}（{first.results.Timings}）");
             Show(first.results, first.loosened);
-            // 2. Those extras (a scan of a million names) if they could add something, then the
-            //    snippets of the rows further down.
+            // 2. Document text and those extras (a scan of a million names) if they could add
+            //    something, then the snippets of the rows further down.
             var final = first.results;
-            if (first.results.ExtraNamesSkipped)
+            if (first.results.ExtraNamesSkipped || first.results.ContentSkipped)
             {
                 if (Run(filter) is not { } deep) return;
-                // Only when the extras added something: otherwise the list would flicker for nothing.
-                if (deep.results.Total != first.results.Total || deep.results.Count != first.results.Count)
+                trace.Add($"第二步完成 {typed.ElapsedMilliseconds}（{deep.results.Timings}）");
+                // Only when the text or the extras changed something: otherwise the list would flicker for nothing.
+                bool same = deep.results.Total == first.results.Total && deep.results.Count == first.results.Count
+                    && deep.results.Select(r => (r.Id, r.ContentMatch)).SequenceEqual(first.results.Select(r => (r.Id, r.ContentMatch)));
+                if (!same)
                 {
                     final = deep.results;
                     Dispatcher.UIThread.Post(() =>
@@ -314,6 +326,14 @@ public partial class SearchWindow : Window
                     });
                 }
             }
+            Dispatcher.UIThread.Post(() =>
+            {
+                if (cts.IsCancellationRequested) return;
+                finished = true;
+                ShowSearching(false);
+                if (typed.ElapsedMilliseconds > 1500)
+                    ErrorLog.Note($"slow search \"{query}\": complete after {typed.ElapsedMilliseconds} ms; {string.Join("; ", trace)}");
+            });
             try { _engine.FillHits(final, cts.Token); }
             catch (OperationCanceledException) { return; }
             catch (Exception e) { ErrorLog.Write("snippets", e); return; }
@@ -334,8 +354,10 @@ public partial class SearchWindow : Window
                 try
                 {
                     var results = _engine.Search(query, f, _settings.MaxResults, cts.Token);
+                    if (attempt > 1) trace.Add($"重试成功 {typed.ElapsedMilliseconds}");
                     // Nothing holds every word: show what holds some of them rather than an empty window.
-                    if (results.Count == 0 && !f.AnyTerm && TextTokenizer.QueryTerms(query).Count > 1)
+                    // (Not before the text was searched too: it may hold them all.)
+                    if (results.Count == 0 && !f.AnyTerm && f.Content && TextTokenizer.QueryTerms(query).Count > 1)
                     {
                         results = _engine.Search(query, f with { AnyTerm = true }, _settings.MaxResults, cts.Token);
                         return (results, results.Count > 0);
@@ -361,7 +383,8 @@ public partial class SearchWindow : Window
         void Show(SearchResults results, bool loosened) => Dispatcher.UIThread.Post(() =>
         {
             if (cts.IsCancellationRequested) return;
-            ShowSearching(false);
+            if (typed.ElapsedMilliseconds > 500)
+                ErrorLog.Note($"slow search \"{query}\": shown after {typed.ElapsedMilliseconds} ms; {string.Join("; ", trace)}; 界面线程接手 {typed.ElapsedMilliseconds}");
             if (!_noticeSticky) Notice.IsVisible = false;
             _lastQuery = query;
             ShowResults(results);
@@ -378,6 +401,7 @@ public partial class SearchWindow : Window
         _items.Clear();
         foreach (var r in results) _items.Add(new ResultItem(r));
         ResultsArea.IsVisible = _items.Count > 0;
+        if (_items.Count == 0) DropPreview();
         if (_items.Count > 0)
         {
             int keep = keepSelected is { } id ? _items.ToList().FindIndex(i => i.Result.Id == id) : -1;
@@ -893,6 +917,20 @@ public partial class SearchWindow : Window
         int at = _hitIndex < _textHits.Count ? _textHits[_hitIndex] : -1;
         PreviewText.Inlines = Highlight(PagePreview.TextWindow(_text, at, out int local), _lastQuery, local);
         PreviewScroll.Offset = default;
+    }
+
+    /// <summary>
+    /// The results are gone (box cleared, nothing found): unload the preview too, and give the
+    /// keyboard back to the search box. A Word/PPT previewer used to stay loaded in the hidden pane
+    /// and keep the keyboard focus, so the next search's typing went to it (or nowhere) until Esc:
+    /// searching again after clearing the box looked very slow.
+    /// </summary>
+    private void DropPreview()
+    {
+        _previewCts?.Cancel();
+        ClearPreviewImage();
+        if (OperatingSystem.IsWindows()) PreviewHandlerHost.TakeFocusBack(TopHandle);
+        Query.Focus();
     }
 
     private void ClearPreviewImage()

@@ -104,4 +104,26 @@ public sealed class SearchStabilityTests : IDisposable
         Assert.Null(results.HitsPending);
         Assert.All(results, r => { Assert.Contains("capybara", r.Snippet); Assert.Equal(2, r.HitCount); });
     }
+
+    [Fact]
+    public void NamesFirstThenText()
+    {
+        var root = Path.Combine(_dir, "docs");
+        Directory.CreateDirectory(root);
+        File.WriteAllText(Path.Combine(root, "okapi plan.md"), "nothing here");
+        File.WriteAllText(Path.Combine(root, "other.md"), "the okapi is mentioned only in this text");
+        var s = new Settings { PauseContentIndexingOnBattery = false };
+        using (var store = new IndexStore(Db, s))
+        using (var indexer = new Indexer(store, s, new[] { root })) indexer.RunOnce();
+
+        using var engine = new SearchEngine(Db);
+        var names = engine.Search("okapi", SearchFilter.None with { Content = false }, 60);
+        Assert.True(names.ContentSkipped);
+        Assert.Equal(new[] { "okapi plan.md" }, names.Select(r => r.Name));
+
+        var all = engine.Search("okapi", SearchFilter.None, 60);
+        Assert.False(all.ContentSkipped);
+        Assert.Contains(all, r => r.Name == "other.md" && r.ContentMatch);
+        Assert.Equal("okapi plan.md", all[0].Name);
+    }
 }

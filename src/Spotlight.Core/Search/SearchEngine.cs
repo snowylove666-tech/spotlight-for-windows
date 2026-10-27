@@ -51,6 +51,8 @@ public sealed class SearchResults : List<SearchResult>
     /// <summary>The "收录全部文件名" extras weren't searched by substring (<see cref="SearchFilter.ExtraNames"/>
     /// off) though they could have added matches: search again with it on.</summary>
     public bool ExtraNamesSkipped { get; set; }
+    /// <summary>Document text wasn't searched (<see cref="SearchFilter.Content"/> off) though the query is long enough.</summary>
+    public bool ContentSkipped { get; set; }
     /// <summary>Text matches past the first rows whose snippet and hit count aren't filled in yet
     /// (<see cref="SearchEngine.FillHits"/>).</summary>
     public List<SearchResult>? HitsPending { get; set; }
@@ -64,7 +66,7 @@ public enum SortBy { Relevance, Modified, Name, Size, Kind }
 /// <param name="ExtraNames">Also look for the query inside names indexed by "收录全部文件名" (program files,
 /// caches): a scan of a million names. The window does it as a second step, after showing the rest.</param>
 public sealed record SearchFilter(IReadOnlyCollection<FileKind>? Kinds = null, SortBy Sort = SortBy.Relevance, bool Descending = true,
-    bool AnyTerm = false, bool ExtraNames = true)
+    bool AnyTerm = false, bool ExtraNames = true, bool Content = true)
 {
     public static SearchFilter None { get; } = new();
 
@@ -133,16 +135,18 @@ public sealed class SearchEngine : IDisposable
         if (fts == null) return results;
         string qLower = query.ToLowerInvariant();
 
+        long asked = System.Diagnostics.Stopwatch.GetTimestamp();
         lock (_lock)
         {
             using var interrupt = InterruptOn(ct);
+            var lockWait = System.Diagnostics.Stopwatch.GetElapsedTime(asked);
             var byId = new Dictionary<long, SearchResult>();
 
             // 1. Candidates by name: FTS token match, plus whole-name prefix via the B-tree index
             //    (so "a" still finds "a.txt" even when thousands of names contain an "a…" word).
             var ids = new HashSet<long>();
             var clock = System.Diagnostics.Stopwatch.StartNew();
-            var steps = new List<string>();
+            var steps = new List<string> { $"等锁 {lockWait.TotalMilliseconds:F0}" };
             void Step(string what) { steps.Add($"{what} {clock.Elapsed.TotalMilliseconds:F0}"); clock.Restart(); }
             var nameIds = QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 3000;", ("$q", fts));
             Step("名称词");
@@ -185,7 +189,10 @@ public sealed class SearchEngine : IDisposable
 
             // 2. Full-text candidates in BM25 order. A single character would match most documents and
             //    only cost time, so content search starts at two characters.
-            if (terms.Sum(t => t.Length) >= 2)
+            // Document text is the part that can take seconds (its index is large: right after a
+            // restart it is read from disk). The window searches names first, without it.
+            if (terms.Sum(t => t.Length) >= 2 && !filter.Content) results.ContentSkipped = true;
+            else if (terms.Sum(t => t.Length) >= 2)
             {
                 var hits = QueryHits("SELECT rowid, bm25(content_fts) FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 1000;", fts);
                 ct.ThrowIfCancellationRequested();
