@@ -57,16 +57,20 @@ if (argList[0] == "check")
     return 0;
 }
 
+// --first: what the search window shows first (without the "收录全部文件名" extras' substrings).
+bool firstStep = argList.Remove("--first");
 using var engine = new SearchEngine(db);
 var query = string.Join(' ', argList.Skip(1));
-engine.Search(query, settings.MaxResults); // warm-up: the launcher keeps the engine hot, so time the second run
+var filter = SearchFilter.None with { ExtraNames = !firstStep };
+engine.Search(query, filter, settings.MaxResults); // warm-up: the launcher keeps the engine hot, so time the second run
 var timer = Stopwatch.StartNew();
-var results = engine.Search(query, settings.MaxResults);
+var results = engine.Search(query, filter, settings.MaxResults);
 timer.Stop();
+engine.FillHits(results);
 foreach (var r in results)
 {
     Console.WriteLine(r);
     if (r.Snippet != null) Console.WriteLine($"         └ {r.Snippet}");
 }
-Console.WriteLine($"{results.Count} 条结果，{timer.Elapsed.TotalMilliseconds:F1} ms");
+Console.WriteLine($"{results.Count} 条结果，{timer.Elapsed.TotalMilliseconds:F1} ms（{results.Timings}）");
 return 0;

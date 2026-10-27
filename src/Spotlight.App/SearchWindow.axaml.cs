@@ -19,6 +19,8 @@ public partial class SearchWindow : Window
     private readonly Settings _settings;
     private readonly ObservableCollection<ResultItem> _items = new();
     private CancellationTokenSource? _searchCts;
+    private CancellationTokenSource? _warmCts;
+    private DateTime _lastSearch;
     private string _lastQuery = "";
     private CancellationTokenSource? _previewCts;
 
@@ -195,6 +197,14 @@ public partial class SearchWindow : Window
         Query.Focus();
         Query.SelectAll();
         _keyboardGuard.Start();
+        // After a long idle Windows has dropped the index from memory: read the name indexes while
+        // the user types the first letters. The first keystroke's search cancels it.
+        if (DateTime.UtcNow - _lastSearch > TimeSpan.FromMinutes(2))
+        {
+            _warmCts?.Cancel();
+            var warm = _warmCts = new CancellationTokenSource();
+            Task.Run(() => { try { _engine.Warm(warm.Token); } catch (Exception) { } });
+        }
     }
 
     // Keeps the keys with the search window while an Office document is on show (see KeepKeyboard).
@@ -225,7 +235,22 @@ public partial class SearchWindow : Window
         Position = new PixelPoint(x, y);
     }
 
-    public void SetIndexStatus(IndexStatus s) => Status.Text = s.Describe();
+    public void SetIndexStatus(IndexStatus s)
+    {
+        _indexStatus = s.Describe();
+        if (!_slowSearch) Status.Text = _indexStatus;
+    }
+
+    private string _indexStatus = "";
+    private bool _slowSearch;
+
+    /// <summary>"正在搜索…" in place of the index status while a search takes a while, so a slow search
+    /// doesn't look like one that found nothing.</summary>
+    private void ShowSearching(bool on)
+    {
+        _slowSearch = on;
+        Status.Text = on ? "正在搜索…" : _indexStatus;
+    }
 
     private bool _noticeSticky;
 
@@ -254,36 +279,95 @@ public partial class SearchWindow : Window
         Footer.IsVisible = FilterBar.IsVisible;
         if (string.IsNullOrWhiteSpace(query))
         {
+            ShowSearching(false);
             _items.Clear();
             ResultsArea.IsVisible = false;
             return;
         }
         var filter = CurrentFilter();
-        // Short debounce so fast typing doesn't run a query per keystroke.
+        _warmCts?.Cancel();
+        _lastSearch = DateTime.UtcNow;
+        Task.Delay(400, cts.Token).ContinueWith(_ => Dispatcher.UIThread.Post(() => { if (!cts.IsCancellationRequested) ShowSearching(true); }),
+            cts.Token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
+        // Short debounce so fast typing doesn't run a query per keystroke. A newer keystroke cancels
+        // this search, which stops its query at once (SearchEngine.InterruptOn).
         Task.Delay(40, cts.Token).ContinueWith(_ =>
         {
-            SearchResults results;
-            bool loosened = false;
-            try
+            // 1. Everything but the "收录全部文件名" extras' substrings: fast, shown at once.
+            if (Run(filter with { ExtraNames = false }) is not { } first) return;
+            Show(first.results, first.loosened);
+            // 2. Those extras (a scan of a million names) if they could add something, then the
+            //    snippets of the rows further down.
+            var final = first.results;
+            if (first.results.ExtraNamesSkipped)
             {
-                results = _engine.Search(query, filter, _settings.MaxResults, cts.Token);
-                // Nothing holds every word: show what holds some of them rather than an empty window.
-                if (results.Count == 0 && !filter.AnyTerm && TextTokenizer.QueryTerms(query).Count > 1)
+                if (Run(filter) is not { } deep) return;
+                // Only when the extras added something: otherwise the list would flicker for nothing.
+                if (deep.results.Total != first.results.Total || deep.results.Count != first.results.Count)
                 {
-                    results = _engine.Search(query, filter with { AnyTerm = true }, _settings.MaxResults, cts.Token);
-                    loosened = results.Count > 0;
+                    final = deep.results;
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (cts.IsCancellationRequested) return;
+                        ShowResults(deep.results, (Results.SelectedItem as ResultItem)?.Result.Id);
+                        if (deep.loosened) ResultCount.Text = $"没有同时含全部关键词的，以下 {deep.results.Total:N0} 项含其中部分";
+                    });
                 }
             }
+            try { _engine.FillHits(final, cts.Token); }
             catch (OperationCanceledException) { return; }
+            catch (Exception e) { ErrorLog.Write("snippets", e); return; }
             Dispatcher.UIThread.Post(() =>
             {
                 if (cts.IsCancellationRequested) return;
-                _lastQuery = query;
-                ShowResults(results);
-                if (loosened) ResultCount.Text = $"没有同时含全部关键词的，以下 {results.Total:N0} 项含其中部分";
-                if (_openWhenReady is { } reveal) { _openWhenReady = null; OpenSelected(reveal); }
+                foreach (var item in _items) item.Refresh();
+                UpdatePreview();
             });
         }, cts.Token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
+
+        // A search, retried once when it fails (e.g. the index is busy for a moment); a failure is
+        // logged and shown instead of leaving the window empty.
+        (SearchResults results, bool loosened)? Run(SearchFilter f)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    var results = _engine.Search(query, f, _settings.MaxResults, cts.Token);
+                    // Nothing holds every word: show what holds some of them rather than an empty window.
+                    if (results.Count == 0 && !f.AnyTerm && TextTokenizer.QueryTerms(query).Count > 1)
+                    {
+                        results = _engine.Search(query, f with { AnyTerm = true }, _settings.MaxResults, cts.Token);
+                        return (results, results.Count > 0);
+                    }
+                    return (results, false);
+                }
+                catch (OperationCanceledException) { return null; }
+                catch (Exception e)
+                {
+                    ErrorLog.Write($"search \"{query}\" (attempt {attempt})", e);
+                    if (attempt < 2) { Thread.Sleep(150); continue; }
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (cts.IsCancellationRequested) return;
+                        ShowSearching(false);
+                        SetNotice("搜索出错：" + e.Message + "（已记录到 error.log，请再输入一次试试）", sticky: false);
+                    });
+                    return null;
+                }
+            }
+        }
+
+        void Show(SearchResults results, bool loosened) => Dispatcher.UIThread.Post(() =>
+        {
+            if (cts.IsCancellationRequested) return;
+            ShowSearching(false);
+            if (!_noticeSticky) Notice.IsVisible = false;
+            _lastQuery = query;
+            ShowResults(results);
+            if (loosened) ResultCount.Text = $"没有同时含全部关键词的，以下 {results.Total:N0} 项含其中部分";
+            if (_openWhenReady is { } reveal) { _openWhenReady = null; OpenSelected(reveal); }
+        });
     }
 
     private void ShowResults(SearchResults results, long? keepSelected = null)
@@ -318,10 +402,12 @@ public partial class SearchWindow : Window
         if (query != _lastQuery || string.IsNullOrWhiteSpace(query)) return;
         long? selected = (Results.SelectedItem as ResultItem)?.Result.Id;
         var filter = CurrentFilter();
+        // Under the current search's token: typing cancels this too, instead of waiting for it.
+        var ct = _searchCts?.Token ?? default;
         Task.Run(() =>
         {
             SearchResults results;
-            try { results = _engine.Search(query, filter, _settings.MaxResults); }
+            try { results = _engine.Search(query, filter, _settings.MaxResults, ct); _engine.FillHits(results, ct); }
             catch (Exception) { return; }
             Dispatcher.UIThread.Post(() => { if (query == _lastQuery && IsVisible) ShowResults(results, selected); });
         });

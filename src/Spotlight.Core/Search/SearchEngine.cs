@@ -46,14 +46,25 @@ public sealed class SearchResults : List<SearchResult>
     public int Total { get; set; }
     /// <summary>The candidate lists hit their caps, so <see cref="Total"/> is a lower bound.</summary>
     public bool AtLeast { get; set; }
+    /// <summary>Where the time went, step by step (diagnostics: spotlight-cli search).</summary>
+    public string? Timings { get; set; }
+    /// <summary>The "收录全部文件名" extras weren't searched by substring (<see cref="SearchFilter.ExtraNames"/>
+    /// off) though they could have added matches: search again with it on.</summary>
+    public bool ExtraNamesSkipped { get; set; }
+    /// <summary>Text matches past the first rows whose snippet and hit count aren't filled in yet
+    /// (<see cref="SearchEngine.FillHits"/>).</summary>
+    public List<SearchResult>? HitsPending { get; set; }
+    internal List<string>? Terms { get; set; }
 }
 
 public enum SortBy { Relevance, Modified, Name, Size, Kind }
 
 /// <summary>Optional narrowing and ordering chosen in the search window.</summary>
 /// <param name="AnyTerm">"模糊匹配": several words match a file holding any of them; files holding more rank higher.</param>
+/// <param name="ExtraNames">Also look for the query inside names indexed by "收录全部文件名" (program files,
+/// caches): a scan of a million names. The window does it as a second step, after showing the rest.</param>
 public sealed record SearchFilter(IReadOnlyCollection<FileKind>? Kinds = null, SortBy Sort = SortBy.Relevance, bool Descending = true,
-    bool AnyTerm = false)
+    bool AnyTerm = false, bool ExtraNames = true)
 {
     public static SearchFilter None { get; } = new();
 
@@ -85,6 +96,25 @@ public sealed class SearchEngine : IDisposable
     /// so "by date" means "the newest of the files that really match".</summary>
     public SearchResults Search(string query, SearchFilter filter, int limit = 60, CancellationToken ct = default)
     {
+        try { return SearchCore(query, filter, limit, ct); }
+        catch (SqliteException e) when (e.SqliteErrorCode == SQLITE_INTERRUPT && ct.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(ct);
+        }
+    }
+
+    private const int SQLITE_INTERRUPT = 9;
+
+    /// <summary>
+    /// While a search runs, cancelling it stops the query SQLite is running. Without this a search
+    /// for an earlier keystroke ran to its end, and the next one waited for it: typing quickly made
+    /// the last search wait for all the ones before it (sometimes seconds). Call inside the lock.
+    /// </summary>
+    private CancellationTokenRegistration InterruptOn(CancellationToken ct) =>
+        ct.CanBeCanceled ? ct.Register(static h => SQLitePCL.raw.sqlite3_interrupt((SQLitePCL.sqlite3)h!), _conn.Handle) : default;
+
+    private SearchResults SearchCore(string query, SearchFilter filter, int limit, CancellationToken ct)
+    {
         query = query.Trim();
         var results = new SearchResults();
         if (query.Length == 0) return results;
@@ -105,12 +135,17 @@ public sealed class SearchEngine : IDisposable
 
         lock (_lock)
         {
+            using var interrupt = InterruptOn(ct);
             var byId = new Dictionary<long, SearchResult>();
 
             // 1. Candidates by name: FTS token match, plus whole-name prefix via the B-tree index
             //    (so "a" still finds "a.txt" even when thousands of names contain an "a…" word).
             var ids = new HashSet<long>();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var steps = new List<string>();
+            void Step(string what) { steps.Add($"{what} {clock.Elapsed.TotalMilliseconds:F0}"); clock.Restart(); }
             var nameIds = QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 3000;", ("$q", fts));
+            Step("名称词");
             bool capped = nameIds.Count >= 3000;
             ids.UnionWith(nameIds);
             foreach (int buried in new[] { 0, 1 }) // one index each (IndexStore.NameIndexes)
@@ -128,13 +163,19 @@ public sealed class SearchEngine : IDisposable
                 var where = string.Join(" AND ", subTerms.Select((_, i) => $"instr(name_lower, $t{i}) > 0"));
                 var args = subTerms.Select((t, i) => ($"$t{i}", (object)t.ToLowerInvariant())).ToArray();
                 var sub = QueryIds($"SELECT id FROM files WHERE buried = 0 AND {where} LIMIT 2000;", args);
-                if (sub.Count < limit) sub.AddRange(QueryIds($"SELECT id FROM files WHERE buried = 1 AND {where} LIMIT 2000;", args));
+                if (sub.Count < limit)
+                {
+                    if (filter.ExtraNames) sub.AddRange(QueryIds($"SELECT id FROM files WHERE buried = 1 AND {where} LIMIT 2000;", args));
+                    else results.ExtraNamesSkipped = true;
+                }
                 capped |= sub.Count >= 2000;
                 ids.UnionWith(sub);
             }
             ct.ThrowIfCancellationRequested();
 
+            Step("子串");
             foreach (var r in LoadRows(ids)) byId[r.Id] = r;
+            Step($"载入{ids.Count}");
             foreach (var r in byId.Values)
             {
                 r.Score = NameScore(r, qLower, terms);
@@ -167,6 +208,7 @@ public sealed class SearchEngine : IDisposable
             }
 
             // 3. Usage: picks for this query (and longer queries starting with it) plus frecency.
+            Step("正文");
             var picks = LoadPicks(IndexStore.NormalizeQuery(query));
             long now = DateTime.UtcNow.Ticks;
             foreach (var r in byId.Values)
@@ -182,7 +224,12 @@ public sealed class SearchEngine : IDisposable
                 ? ranked.Take(limit).ToList()
                 : Order(ranked.Take(Math.Max(limit, 300)), filter).Take(limit).ToList();
 
-            foreach (var r in top.Where(r => r.ContentMatch)) FillHit(r, terms);
+            Step("排序");
+            // Snippets read each document's whole text: the first rows now, the rest when asked (FillHits).
+            foreach (var r in top.Take(SnippetsNow).Where(r => r.ContentMatch)) FillHit(r, terms);
+            var later = top.Skip(SnippetsNow).Where(r => r.ContentMatch).ToList();
+            if (later.Count > 0) { results.HitsPending = later; results.Terms = terms; }
+            Step("摘要");
             if (any)
                 foreach (var r in top)
                 {
@@ -190,6 +237,7 @@ public sealed class SearchEngine : IDisposable
                     r.TermsMatched = Math.Max(r.TermsMatched, WordsIn(r.Name, terms));
                 }
             results.AddRange(top);
+            results.Timings = string.Join(" ", steps) + " ms";
             results.Total = byId.Values.Count(r => r.Score > 0 && (filter.Kinds == null || filter.Kinds.Contains(r.Kind)));
             results.AtLeast = capped;
         }
@@ -575,6 +623,52 @@ public sealed class SearchEngine : IDisposable
             s = (start > 0 ? "…" : "") + text[start..end] + (end < text.Length ? "…" : "");
         }
         return s.Replace('\n', ' ');
+    }
+
+    private const int SnippetsNow = 12;
+
+    /// <summary>Fills in the snippets and hit counts <see cref="SearchResults.HitsPending"/> lists.</summary>
+    public void FillHits(SearchResults results, CancellationToken ct = default)
+    {
+        if (results.HitsPending is not { Count: > 0 } rest || results.Terms == null) return;
+        try
+        {
+            lock (_lock)
+            {
+                using var interrupt = InterruptOn(ct);
+                foreach (var r in rest)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    FillHit(r, results.Terms);
+                }
+            }
+            results.HitsPending = null;
+        }
+        catch (SqliteException e) when (e.SqliteErrorCode == SQLITE_INTERRUPT && ct.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(ct);
+        }
+    }
+
+    /// <summary>Reads the name indexes once, so the first search after a long idle doesn't wait for
+    /// the disk (Windows drops the index from its file cache while it isn't used). A search cancels it.</summary>
+    public void Warm(CancellationToken ct)
+    {
+        foreach (var sql in new[] { "SELECT max(length(name_lower)) FROM files WHERE buried = 0;", "SELECT max(length(name_lower)) FROM files WHERE buried = 1;" })
+        {
+            if (ct.IsCancellationRequested) return;
+            try
+            {
+                lock (_lock)
+                {
+                    using var interrupt = InterruptOn(ct);
+                    using var c = _conn.CreateCommand();
+                    c.CommandText = sql;
+                    c.ExecuteScalar();
+                }
+            }
+            catch (SqliteException e) when (e.SqliteErrorCode == SQLITE_INTERRUPT) { return; }
+        }
     }
 
     public void ReleaseMemory()

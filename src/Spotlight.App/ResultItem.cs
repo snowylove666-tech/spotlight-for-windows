@@ -89,6 +89,9 @@ public sealed class ResultItem : INotifyPropertyChanged
         _ => $"{bytes / 1024.0 / 1024 / 1024:F2} GB",
     };
 
+    /// <summary>The snippet or hit count arrived (filled in after the list was shown).</summary>
+    public void Refresh() => Changed(nameof(Subtitle));
+
     public event PropertyChangedEventHandler? PropertyChanged;
     private void Changed(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
