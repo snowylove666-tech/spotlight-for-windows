@@ -63,6 +63,14 @@
                   Content="收录全部文件名（像 Everything）：所有磁盘上的所有文件，包括 AppData、Windows、Program Files、node_modules、隐藏文件" />
         <TextBlock Classes="hint" Text="这些位置只收录文件名、不读正文，搜索结果排在你自己的文件后面。会多收录约百万个文件名，索引大几百 MB，第一次需要几分钟扫描。" />
 
+        <TextBlock Classes="h" Text="快速扫描（管理员后台服务）" />
+        <TextBlock x:Name="MftState" TextWrapping="Wrap" />
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,6,0,0">
+          <Button x:Name="MftInstall" Content="启用…" />
+          <Button x:Name="MftUninstall" Content="停用…" />
+        </StackPanel>
+        <TextBlock Classes="hint" Text="像 Everything 一样直接读取 NTFS 硬盘的主文件表，建索引和重新扫描不再逐个打开文件夹。需要管理员权限：启用和停用时 Windows 会询问一次。服务只在扫描时运行，空闲两分钟后自动停止；没有启用、或不是 NTFS 的硬盘照常逐个文件夹扫描。" />
+
         <TextBlock Classes="h" Text="不搜索这些文件夹" />
         <TextBlock Classes="hint" Text="文件夹及其中的所有内容都不会被索引。" />
         <ListBox x:Name="ExcludedList" Classes="paths" Height="90" />

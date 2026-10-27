@@ -84,7 +84,10 @@ public partial class IndexStatusWindow : Window
             : $"{last.Finished:MM-dd HH:mm} 完成，用时 {Took(last.Took)}：扫描前 {last.FilesBefore:N0} 项 → 扫描后 {last.FilesAfter:N0} 项，"
               + $"新增 {last.Added:N0}，删除 {last.Removed:N0}"
               + (last.TextDropped > 0 ? $"，清除了 {last.TextDropped:N0} 个文档不再需要的正文" : "")
-              + (last.MissingRoots.Count > 0 ? $"。以下位置不存在或无法访问：{string.Join("、", last.MissingRoots)}" : "。");
+              + (last.Unchanged > 0 ? $"，{last.Unchanged:N0} 项没有变化（不重写）" : "")
+              + (last.MissingRoots.Count > 0 ? $"。以下位置不存在或无法访问：{string.Join("、", last.MissingRoots)}" : "。")
+              + (last.Mft != null ? "\n" + last.Mft
+                 : MftService.Installed ? "" : "\n逐个文件夹扫描。在设置 → 快速扫描 启用管理员后台服务后，直接读取主文件表。");
 
         bool custom = _settings.Roots.Count > 0;
         var roots = cur.indexer.Roots;

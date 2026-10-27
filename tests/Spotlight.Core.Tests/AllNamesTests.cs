@@ -16,6 +16,7 @@ public sealed class AllNamesTests : IDisposable
     {
         Directory.CreateDirectory(Path.Combine(Root, "node_modules", "pkg"));
         File.WriteAllText(Path.Combine(Root, "node_modules", "pkg", "wombat crash.log"), "wombat");
+        File.WriteAllText(Path.Combine(Root, "node_modules", "pkg", "xxnumbatboot17.log"), "x");
         File.WriteAllText(Path.Combine(Root, "wombat notes.md"), "wombat");
         var hidden = Path.Combine(Root, "wombat hidden.md");
         File.WriteAllText(hidden, "x");
@@ -71,5 +72,14 @@ public sealed class AllNamesTests : IDisposable
         var names = Index(false).Select(r => r.Name).ToList();
         Assert.DoesNotContain("wombat crash.log", names);
         Assert.Contains("wombat notes.md", names);
+    }
+
+    [Fact]
+    public void ASpecificPieceOfAnExtraNameFindsIt()
+    {
+        Index(true);
+        using var e = new SearchEngine(Db);
+        // Only a substring inside one word: no token matches it.
+        Assert.Contains(e.Search("numbatboot", limit: 50), r => r.Name == "xxnumbatboot17.log");
     }
 }

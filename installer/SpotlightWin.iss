@@ -65,6 +65,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\artifacts\installer\app\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\artifacts\installer\app\SpotlightWin.MftService.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -80,6 +81,8 @@ Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExe}"; Flags: runhidden; RunOnceId: "StopSpotlightWin"
+; The MFT service, if the user turned it on: removing it needs administrator rights (Windows asks).
+Filename: "{app}\SpotlightWin.MftService.exe"; Parameters: "uninstall"; Verb: "runas"; Flags: shellexec waituntilterminated runhidden; Check: MftServiceInstalled; RunOnceId: "RemoveMftService"
 
 [Code]
 const
@@ -110,6 +113,11 @@ begin
     P := Pos(' --', Value);
     if P > 0 then Result := Copy(Value, 1, P - 1) else Result := Value;
   end;
+end;
+
+function MftServiceInstalled(): Boolean;
+begin
+  Result := RegKeyExists(HKLM, 'SYSTEM\CurrentControlSet\Services\SpotlightWinMft');
 end;
 
 function SamePath(A, B: String): Boolean;

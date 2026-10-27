@@ -3,6 +3,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Platform.Storage;
 using Spotlight.Core;
+using Spotlight.Core.Indexing;
 
 namespace Spotlight.App;
 
@@ -122,6 +123,9 @@ public partial class SettingsWindow : Window
         AddRoot.Click += async (_, _) => { if (await PickFolder("选择要搜索的文件夹或磁盘") is { } p) { AddUnique(_roots, p); _usingDefaultRoots = false; UpdateRootsHint(); } };
         RemoveRoot.Click += (_, _) => { if (RootsList.SelectedItem is string s) { _roots.Remove(s); _usingDefaultRoots = false; UpdateRootsHint(); } };
         DefaultRoots.Click += (_, _) => SetRoots(new Settings().EffectiveRoots(), true);
+        MftInstall.Click += async (_, _) => await RunMftService("install");
+        MftUninstall.Click += async (_, _) => await RunMftService("uninstall");
+        UpdateMftState(null);
         AddExcluded.Click += async (_, _) => { if (await PickFolder("选择不需要搜索的文件夹") is { } p) AddUnique(_excluded, p); };
         RemoveExcluded.Click += (_, _) => { if (ExcludedList.SelectedItem is string s) _excluded.Remove(s); };
         AddNoContent.Click += async (_, _) => { if (await PickFolder("选择只收录文件名的文件夹") is { } p) AddUnique(_noContent, p); };
@@ -140,6 +144,24 @@ public partial class SettingsWindow : Window
         foreach (var r in roots) _roots.Add(r);
         _usingDefaultRoots = isDefault;
         UpdateRootsHint();
+    }
+
+    private async Task RunMftService(string verb)
+    {
+        MftInstall.IsEnabled = MftUninstall.IsEnabled = false;
+        MftState.Text = "请在 Windows 的提示里选择「是」…";
+        string? error = null;
+        bool ok = await Task.Run(() => MftService.RunElevated(verb, out error));
+        UpdateMftState(ok ? null : error);
+    }
+
+    private void UpdateMftState(string? error)
+    {
+        bool on = MftService.Installed;
+        MftState.Text = (on ? "✓ 已启用：重新扫描和建索引时直接读取主文件表" : "未启用")
+            + (error != null ? $"（操作没有完成：{error}）" : "");
+        MftInstall.IsEnabled = !on;
+        MftUninstall.IsEnabled = on;
     }
 
     private void UpdateRootsHint() => RootsHint.Text = _usingDefaultRoots

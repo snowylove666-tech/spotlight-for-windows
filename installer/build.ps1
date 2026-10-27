@@ -7,6 +7,9 @@ $version = $props.Project.PropertyGroup.Version
 
 dotnet publish (Join-Path $root 'src\Spotlight.App') -c Release -r win-x64 -o (Join-Path $root 'artifacts\installer\app')
 if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed' }
+# The MFT service ships next to the app; the app installs it (elevated) when the user turns it on.
+dotnet publish (Join-Path $root 'src\Spotlight.MftService') -c Release -r win-x64 -o (Join-Path $root 'artifacts\installer\app')
+if ($LASTEXITCODE -ne 0) { throw 'dotnet publish (service) failed' }
 
 $iscc = @("$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") |
     Where-Object { Test-Path $_ } | Select-Object -First 1

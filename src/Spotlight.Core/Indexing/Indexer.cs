@@ -10,6 +10,13 @@ public enum IndexPhase { Starting, Scanning, ReadingContents, Idle, PausedOnBatt
 public sealed record ScanReport(DateTime Started, DateTime Finished, long FilesBefore, long FilesAfter,
     long Added, long Removed, long SizeBefore, long SizeAfter, IReadOnlyList<string> MissingRoots, int TextDropped)
 {
+    /// <summary>How the drives were read: from the master file table (and how long that took), or why not.</summary>
+    public string? Mft { get; init; }
+    /// <summary>Entries found unchanged, whose rows weren't rewritten.</summary>
+    public int Unchanged { get; init; }
+    /// <summary>Where the time went (diagnostics).</summary>
+    public string? Timings { get; init; }
+
     public TimeSpan Took => Finished - Started;
 }
 
@@ -59,6 +66,8 @@ public sealed class Indexer : IDisposable
     // and the places indexed in full (everything else on the drives is name-only).
     private readonly HashSet<string> _buriedNames;
     private readonly IReadOnlyList<string> _normalRoots;
+    // The same, without and with a trailing separator: compared with every entry of an "all names" crawl.
+    private readonly string[] _normalRootsTrimmed, _normalRootsPrefix;
     private readonly CancellationTokenSource _cts = new();
     private Thread? _thread;
     private volatile bool _fullRescanRequested;
@@ -68,6 +77,12 @@ public sealed class Indexer : IDisposable
     /// <summary>Raised on the indexer thread after each full scan.</summary>
     public event Action<ScanReport>? ScanFinished;
     public ScanReport? LastScan { get; private set; }
+
+    // During a full crawl or a rescan: the drives' master file tables (from the MFT service) and
+    // what the index held before, so unchanged entries aren't written again.
+    private Dictionary<string, MftVolume>? _mft;
+    private IndexStore.KnownRows? _known;
+    private string? _mftInfo;
     private int _textDropped;
 
     /// <summary>Raised on the indexer thread whenever it has caught up and is about to sleep.</summary>
@@ -86,6 +101,8 @@ public sealed class Indexer : IDisposable
         _excludedNames = new HashSet<string>(settings.IndexAllNames ? Settings.AlwaysSkippedDirNames : settings.ExcludedDirNames, StringComparer.OrdinalIgnoreCase);
         _buriedNames = new HashSet<string>(settings.IndexAllNames ? settings.ExcludedDirNames.Except(Settings.AlwaysSkippedDirNames, StringComparer.OrdinalIgnoreCase) : Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
         _normalRoots = roots ?? Settings.AppRoots().Concat(settings.NormalRoots()).ToList();
+        _normalRootsTrimmed = _normalRoots.Select(r => Path.TrimEndingDirectorySeparator(r)).ToArray();
+        _normalRootsPrefix = _normalRootsTrimmed.Select(Settings.WithSeparator).ToArray();
         _ownFiles = Path.GetFullPath(store.DbPath);
         Roots = roots ?? Settings.AppRoots().Concat(settings.EffectiveRoots()).ToList();
     }
@@ -399,10 +416,20 @@ public sealed class Indexer : IDisposable
         return !UnderNormalRoot(e.Path);
     }
 
-    private bool IsNormalRoot(string path) => _normalRoots.Any(r => Path.TrimEndingDirectorySeparator(r).Equals(Path.TrimEndingDirectorySeparator(path), StringComparison.OrdinalIgnoreCase));
+    private bool IsNormalRoot(string path)
+    {
+        var p = Path.TrimEndingDirectorySeparator(path.AsSpan());
+        foreach (var r in _normalRootsTrimmed)
+            if (p.Equals(r, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
 
-    private bool UnderNormalRoot(string path) => _normalRoots.Any(r =>
-        path.StartsWith(Settings.WithSeparator(r), StringComparison.OrdinalIgnoreCase) || IsNormalRoot(path));
+    private bool UnderNormalRoot(string path)
+    {
+        foreach (var r in _normalRootsPrefix)
+            if (path.StartsWith(r, StringComparison.OrdinalIgnoreCase)) return true;
+        return IsNormalRoot(path);
+    }
 
     /// <summary>File types or folders switched to name-only: drop their text and give the space back.</summary>
     private void DropUnwantedText()
@@ -419,19 +446,40 @@ public sealed class Indexer : IDisposable
     private void FullScan(CancellationToken ct)
     {
         var started = DateTime.Now;
-        var (before, _) = _store.Counts(exact: true);
         long sizeBefore = _store.SizeBytes(), insertedBefore = _store.Inserted, deletedBefore = _store.Deleted;
         long gen = _store.NextGeneration();
         var starts = _journals.Values.Where(j => j.Query()).ToDictionary(j => j, j => j.NextUsn);
-        foreach (var root in Roots) ScanRoot(root, gen, ct);
-        // Anything not seen by this crawl is gone, outside the configured locations, or now filtered out.
-        _store.DeleteOlderThan(gen);
+        int unchanged;
+        long before;
+        var phase = Stopwatch.StartNew();
+        var timings = new List<string>();
+        void Lap(string what) { timings.Add($"{what} {phase.Elapsed.TotalSeconds:F1}s"); phase.Restart(); }
+        _store.BulkWrites(true, empty: _store.Counts().files == 0);
+        try
+        {
+            // The service reads the drives while the index is read here. (Nothing here may wait for
+            // the store meanwhile: LoadKnown holds it.)
+            Publish(IndexPhase.Scanning, "读取文件列表");
+            var known = Task.Run(() => _store.LoadKnown(null));
+            LoadMft(Roots);
+            Lap("主文件表");
+            _known = known.GetAwaiter().GetResult();
+            Lap("读取已有索引");
+            foreach (var root in Roots) ScanRoot(root, gen, ct);
+            Lap("遍历和写入");
+            // Anything not seen by this crawl is gone, outside the configured locations, or now filtered out.
+            _store.DeleteUnseen(_known);
+            Lap("删除");
+            unchanged = _known.Unchanged;
+            before = _known.Count - (int)(_store.Inserted - insertedBefore);
+        }
+        finally { _known = null; _mft = null; _store.BulkWrites(false); }
         foreach (var (j, usn) in starts) SaveCursor(j, usn);
         _store.SetMeta("scope", ScopeSignature());
-        var (after, _) = _store.Counts(exact: true);
-        // Each root sweeps its own stale rows as it finishes; count those too.
+        long after = before + (_store.Inserted - insertedBefore) - (_store.Deleted - deletedBefore);
         LastScan = new ScanReport(started, DateTime.Now, before, after, _store.Inserted - insertedBefore, _store.Deleted - deletedBefore,
-            sizeBefore, _store.SizeBytes(), Roots.Where(r => !Directory.Exists(r)).ToList(), _textDropped);
+            sizeBefore, _store.SizeBytes(), Roots.Where(r => !Directory.Exists(r)).ToList(), _textDropped)
+            { Mft = _mftInfo, Unchanged = unchanged, Timings = string.Join("，", timings) };
         _textDropped = 0;
         ScanFinished?.Invoke(LastScan);
     }
@@ -441,10 +489,45 @@ public sealed class Indexer : IDisposable
     private void Rescan(string root, CancellationToken ct)
     {
         long gen = _store.NextGeneration();
-        foreach (var nested in Roots.Where(r => !r.Equals(root, StringComparison.OrdinalIgnoreCase)
-                     && r.StartsWith(Settings.WithSeparator(root), StringComparison.OrdinalIgnoreCase)))
-            ScanRoot(nested, gen, ct);
-        ScanRoot(root, gen, ct);
+        try
+        {
+            var known = Task.Run(() => _store.LoadKnown(new[] { root }));
+            LoadMft(new[] { root });
+            _known = known.GetAwaiter().GetResult();
+            foreach (var nested in Roots.Where(r => !r.Equals(root, StringComparison.OrdinalIgnoreCase)
+                         && r.StartsWith(Settings.WithSeparator(root), StringComparison.OrdinalIgnoreCase)))
+                ScanRoot(nested, gen, ct);
+            ScanRoot(root, gen, ct);
+            _store.DeleteUnseen(_known);
+        }
+        finally { _known = null; _mft = null; }
+    }
+
+    /// <summary>Asks the MFT service for the tables of the NTFS drives holding <paramref name="roots"/>.
+    /// Drives it can't read (service not installed, not NTFS) are crawled folder by folder.</summary>
+    /// <summary>Entries below which a non-root crawl lists folders directly (tests set 0 to force the table).</summary>
+    internal long MftWorthwhile { get; set; } = 30_000;
+
+    private void LoadMft(IEnumerable<string> roots)
+    {
+        _mft = new(StringComparer.OrdinalIgnoreCase);
+        _mftInfo = null;
+        if (!MftService.Installed) return;
+        var info = new List<string>();
+        foreach (var group in roots.GroupBy(r => Path.GetPathRoot(r)!, StringComparer.OrdinalIgnoreCase))
+        {
+            string volume = group.Key;
+            try { if (new DriveInfo(volume).DriveFormat != "NTFS") continue; } catch (IOException) { continue; }
+            // Reading a table takes a few seconds whatever is crawled: worth it for a whole drive or a
+            // big part of one, not for a few folders (listing them directly is faster).
+            bool whole = group.Any(r => Path.TrimEndingDirectorySeparator(r).Length <= 2 || r.Length == volume.Length);
+            if (!whole && MftWorthwhile > 0 && group.Sum(r => _store.CountUnder(r)) < MftWorthwhile) continue;
+            var v = MftVolume.Load(volume, out var why);
+            if (v != null) _mft[volume] = v;
+            string drive = volume.TrimEnd('\\');
+            info.Add(v != null ? $"{drive} 读取主文件表 {v.Count:N0} 项，用时 {v.Took.TotalSeconds:F1} 秒" : $"{drive} 未用主文件表：{why}");
+        }
+        _mftInfo = info.Count > 0 ? string.Join("；", info) : null;
     }
 
     // ---------------------------------------------------------------- crawling
@@ -453,9 +536,12 @@ public sealed class Indexer : IDisposable
     {
         if (!Directory.Exists(root)) return;
         Publish(IndexPhase.Scanning, root);
-        var stack = new Stack<(string dir, bool buried)>();
-        bool rootBuried = DirLister.Stat(root) is { } rs && IsBuried(rs, Path.GetDirectoryName(root) is { } up && _store.Buried(up) == true);
-        stack.Push((root, rootBuried));
+        var stack = new Stack<(string dir, long fid, bool buried)>();
+        var rootEntry = DirLister.Stat(root);
+        bool rootBuried = rootEntry is { } rs && IsBuried(rs, Path.GetDirectoryName(root) is { } up && _store.Buried(up) == true);
+        stack.Push((root, rootEntry?.Fid ?? 0, rootBuried));
+        var mft = _mft?.GetValueOrDefault(Path.GetPathRoot(root)!);
+        var known = _known;
         var skip = AttributesToSkip;
         int inBatch = 0;
         var sw = Stopwatch.StartNew();
@@ -465,8 +551,8 @@ public sealed class Indexer : IDisposable
             while (stack.Count > 0)
             {
                 ct.ThrowIfCancellationRequested();
-                var (dir, dirBuried) = stack.Pop();
-                foreach (var (e, isLink) in DirLister.List(dir))
+                var (dir, dirFid, dirBuried) = stack.Pop();
+                foreach (var (e, isLink) in mft?.List(dirFid, dir) ?? DirLister.List(dir))
                 {
                     if ((e.Attributes & skip) != 0) continue;
                     bool buried = IsBuried(e, dirBuried);
@@ -474,11 +560,11 @@ public sealed class Indexer : IDisposable
                     {
                         if (_excludedNames.Contains(e.Name) || IsExcludedPath(e.Path)) continue;
                         // Don't follow junctions/symlinks: they create loops and duplicate trees.
-                        if (!isLink) stack.Push((e.Path, buried));
+                        if (!isLink) stack.Push((e.Path, e.Fid, buried));
                     }
                     else if (_settings.IsExcludedFile(e.Extension) || IsExcludedPath(e.Path)) continue;
-                    _store.Upsert(e, gen, buried);
-                    if (++inBatch >= 2000)
+                    if (known == null || !_store.SeenUnchanged(known, e, buried)) _store.Upsert(e, gen, buried, isNew: known?.Missing == true);
+                    if (++inBatch >= (known != null ? 20000 : 2000))
                     {
                         _store.CommitBatch();
                         inBatch = 0;
@@ -489,11 +575,12 @@ public sealed class Indexer : IDisposable
                     }
                 }
             }
-            if (DirLister.Stat(root) is { } self) _store.Upsert(self, gen, rootBuried);
+            if (rootEntry is { } self) { if (known == null || !_store.SeenUnchanged(known, self, rootBuried)) _store.Upsert(self, gen, rootBuried); }
             else _store.Upsert(new DirectoryInfo(root), gen);
         }
         finally { _store.CommitBatch(); }
-        if (sweep) _store.DeleteStale(root, gen);
+        // A full crawl or rescan deletes what it didn't see once at the end (DeleteUnseen): unchanged rows keep their old generation.
+        if (sweep && known == null) _store.DeleteStale(root, gen);
     }
 
     /// <summary>True for junctions and symbolic links. Other reparse points are real folders: cloud sync

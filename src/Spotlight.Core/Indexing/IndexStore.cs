@@ -104,7 +104,6 @@ public sealed class IndexStore : IDisposable
                 content_note TEXT,
                 launch_count INTEGER NOT NULL DEFAULT 0,
                 last_launch INTEGER NOT NULL DEFAULT 0);
-            CREATE INDEX IF NOT EXISTS ix_files_name ON files(name_lower);
             CREATE INDEX IF NOT EXISTS ix_files_pending ON files(id) WHERE wants_content = 1 AND content_mtime <> mtime;
             CREATE VIRTUAL TABLE IF NOT EXISTS names_fts USING fts5(tokens, tokenize='unicode61 remove_diacritics 2', content='', contentless_delete=1);
             CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(tokens, tokenize='unicode61 remove_diacritics 2', content='', contentless_delete=1);
@@ -131,6 +130,9 @@ public sealed class IndexStore : IDisposable
             while (r.Read()) hasBuried |= r.GetString(1) == "buried";
         }
         if (!hasBuried) Exec(_conn, "ALTER TABLE files ADD COLUMN buried INTEGER NOT NULL DEFAULT 0;");
+        // 0.8.2: names indexed in two parts, the user's own files and the "收录全部文件名" extras, so a
+        // substring search can scan the first alone (see SearchEngine). They replace ix_files_name.
+        Exec(_conn, NameIndexes + "DROP INDEX IF EXISTS ix_files_name;");
         Exec(_conn, "CREATE INDEX IF NOT EXISTS ix_files_fid ON files(fid) WHERE fid IS NOT NULL;");
     }
 
@@ -247,7 +249,8 @@ public sealed class IndexStore : IDisposable
 
     /// <summary>Inserts or refreshes one entry. Must be called between BeginBatch and CommitBatch.</summary>
     /// <param name="buried">Indexed only because of "收录全部文件名": its text is never read.</param>
-    public void Upsert(FsEntry e, long gen, bool buried = false)
+    /// <param name="isNew">Known not to be in the index (a full crawl checked): skips looking it up.</param>
+    public void Upsert(FsEntry e, long gen, bool buried = false, bool isNew = false)
     {
         bool isDir = e.IsDir;
         string path = e.Path;
@@ -259,9 +262,10 @@ public sealed class IndexStore : IDisposable
         bool wants = !buried && WantsContent(path, ext, size, kind) && !IsCloudOnly(e.Attributes);
         object fid = e.Fid != 0 ? e.Fid : DBNull.Value;
 
-        using (var sel = Cmd("SELECT id, mtime, size, fid, buried FROM files WHERE path = $p;"))
+        if (!isNew)
         {
-            sel.Parameters.AddWithValue("$p", path);
+            var sel = Prepared(ref _select, "SELECT id, mtime, size, fid, buried FROM files WHERE path = $p;", "$p");
+            sel.Parameters["$p"].Value = path;
             using var r = sel.ExecuteReader();
             if (r.Read())
             {
@@ -290,30 +294,201 @@ public sealed class IndexStore : IDisposable
             }
         }
 
-        using (var ins = Cmd("""
+        var ins = Prepared(ref _insert, """
             INSERT INTO files(path, name, name_lower, ext, kind, size, mtime, gen, wants_content, fid, buried)
             VALUES($p, $n, $nl, $e, $k, $s, $m, $g, $w, $f, $b) RETURNING id;
-            """))
-        {
-            ins.Parameters.AddWithValue("$b", buried ? 1 : 0);
-            ins.Parameters.AddWithValue("$f", fid);
-            ins.Parameters.AddWithValue("$p", path);
-            ins.Parameters.AddWithValue("$n", display);
-            ins.Parameters.AddWithValue("$nl", display.ToLowerInvariant());
-            ins.Parameters.AddWithValue("$e", ext);
-            ins.Parameters.AddWithValue("$k", (int)kind);
-            ins.Parameters.AddWithValue("$s", size);
-            ins.Parameters.AddWithValue("$m", mtime);
-            ins.Parameters.AddWithValue("$g", gen);
-            ins.Parameters.AddWithValue("$w", wants ? 1 : 0);
-            long id = Convert.ToInt64(ins.ExecuteScalar());
-            Inserted++;
+            """, "$p", "$n", "$nl", "$e", "$k", "$s", "$m", "$g", "$w", "$f", "$b");
+        var p = ins.Parameters;
+        p["$b"].Value = buried ? 1 : 0;
+        p["$f"].Value = fid;
+        p["$p"].Value = path;
+        p["$n"].Value = display;
+        p["$nl"].Value = display.ToLowerInvariant();
+        p["$e"].Value = ext;
+        p["$k"].Value = (int)kind;
+        p["$s"].Value = size;
+        p["$m"].Value = mtime;
+        p["$g"].Value = gen;
+        p["$w"].Value = wants ? 1 : 0;
+        long newId = Convert.ToInt64(ins.ExecuteScalar());
+        Inserted++;
 
-            using var fts = Cmd("INSERT INTO names_fts(rowid, tokens) VALUES($id, $t);");
-            fts.Parameters.AddWithValue("$id", id);
-            fts.Parameters.AddWithValue("$t", NameTokens(display, ext));
-            fts.ExecuteNonQuery();
+        var fts = Prepared(ref _insertName, "INSERT INTO names_fts(rowid, tokens) VALUES($id, $t);", "$id", "$t");
+        fts.Parameters["$id"].Value = newId;
+        fts.Parameters["$t"].Value = NameTokens(display, ext);
+        fts.ExecuteNonQuery();
+    }
+
+    // The statements a crawl runs for every entry, prepared once (preparing them per row was a
+    // good part of a first crawl's time).
+    private SqliteCommand? _select, _insert, _insertName;
+
+    private SqliteCommand Prepared(ref SqliteCommand? cmd, string sql, params string[] names)
+    {
+        if (cmd == null)
+        {
+            cmd = _conn.CreateCommand();
+            cmd.CommandText = sql;
+            foreach (var n in names) cmd.Parameters.Add(new SqliteParameter(n, DBNull.Value));
         }
+        cmd.Transaction = _tx;
+        return cmd;
+    }
+
+    private bool _indexesDropped;
+
+    private const string NameIndexes = """
+        CREATE INDEX IF NOT EXISTS ix_files_visible ON files(name_lower) WHERE buried = 0;
+        CREATE INDEX IF NOT EXISTS ix_files_buried ON files(name_lower) WHERE buried = 1;
+        """;
+
+    /// <summary>
+    /// While a crawl may write hundreds of thousands of rows: a 256 MB page cache instead of 4 MB
+    /// (inserting into the name and path indexes otherwise goes to disk for almost every row), and
+    /// checkpoint the log every 80 MB instead of every 4 MB. Into an empty index, the secondary
+    /// indexes are built once at the end, which is much faster than keeping them up to date row by row.
+    /// </summary>
+    public void BulkWrites(bool on, bool empty = false)
+    {
+        lock (_lock)
+        {
+            if (on)
+            {
+                Exec(_conn, "PRAGMA cache_size=-262144; PRAGMA wal_autocheckpoint=20000;");
+                if (empty)
+                {
+                    Exec(_conn, "DROP INDEX IF EXISTS ix_files_fid; DROP INDEX IF EXISTS ix_files_pending; DROP INDEX IF EXISTS ix_files_visible; DROP INDEX IF EXISTS ix_files_buried;");
+                    _indexesDropped = true;
+                }
+                return;
+            }
+            if (_indexesDropped)
+            {
+                Exec(_conn, """
+                    CREATE INDEX IF NOT EXISTS ix_files_pending ON files(id) WHERE wants_content = 1 AND content_mtime <> mtime;
+                    CREATE INDEX IF NOT EXISTS ix_files_fid ON files(fid) WHERE fid IS NOT NULL;
+                    """ + NameIndexes);
+                _indexesDropped = false;
+            }
+            Exec(_conn, "PRAGMA wal_autocheckpoint=1000; PRAGMA wal_checkpoint(PASSIVE); PRAGMA cache_size=-4000; PRAGMA shrink_memory;");
+        }
+    }
+
+    // ---------------------------------------------------------------- full crawls: write only what changed
+
+    /// <summary>
+    /// What the index held before a full crawl, keyed by a hash of the path. A crawl that finds an
+    /// entry unchanged skips it instead of rewriting its row (a rescan of 1.5 million unchanged names
+    /// used to rewrite all of them), and whatever it didn't see is deleted at the end.
+    /// </summary>
+    public sealed class KnownRows
+    {
+        internal readonly Dictionary<ulong, Row> Rows;
+        internal KnownRows(int capacity) => Rows = new(capacity);
+        public int Count => Rows.Count;
+        public int Unchanged { get; internal set; }
+        /// <summary>Whether the entry last passed to <see cref="SeenUnchanged"/> isn't in the index yet.</summary>
+        public bool Missing { get; internal set; }
+
+        internal struct Row
+        {
+            public long Id, MTime, Size, Fid;
+            public bool Buried, Wants, Seen, Fresh;
+        }
+
+        internal static ulong Key(string path)
+        {
+            // FNV-1a over the path as COLLATE NOCASE compares it (ASCII case folded).
+            ulong h = 14695981039346656037;
+            foreach (char ch in path)
+            {
+                char c = ch is >= 'A' and <= 'Z' ? (char)(ch + 32) : ch;
+                h = (h ^ c) * 1099511628211;
+            }
+            return h;
+        }
+    }
+
+    /// <summary>How many rows are at or under <paramref name="path"/>.</summary>
+    public long CountUnder(string path)
+    {
+        lock (_lock)
+        {
+            var (lo, hi) = PrefixRange(path);
+            using var c = Cmd("SELECT COUNT(*) FROM files WHERE path = $r OR (path >= $lo AND path < $hi);");
+            c.Parameters.AddWithValue("$r", path);
+            c.Parameters.AddWithValue("$lo", lo);
+            c.Parameters.AddWithValue("$hi", hi);
+            return Convert.ToInt64(c.ExecuteScalar());
+        }
+    }
+
+    /// <summary>Loads the rows a crawl of <paramref name="roots"/> will see (all rows when null).</summary>
+    public KnownRows LoadKnown(IReadOnlyList<string>? roots)
+    {
+        lock (_lock)
+        {
+            var (count, _) = Counts();
+            var known = new KnownRows((int)Math.Min(count + 1024, int.MaxValue / 4));
+            var where = new List<string>();
+            using var c = Cmd("");
+            int i = 0;
+            foreach (var root in roots ?? Array.Empty<string>())
+            {
+                var (lo, hi) = PrefixRange(root);
+                where.Add($"path = $r{i} OR (path >= $lo{i} AND path < $hi{i})");
+                c.Parameters.AddWithValue($"$r{i}", root);
+                c.Parameters.AddWithValue($"$lo{i}", lo);
+                c.Parameters.AddWithValue($"$hi{i}", hi);
+                i++;
+            }
+            c.CommandText = "SELECT id, path, mtime, size, fid, buried, wants_content FROM files"
+                + (roots == null ? "" : " WHERE " + (where.Count == 0 ? "0" : string.Join(" OR ", where))) + ";";
+            using var r = c.ExecuteReader();
+            while (r.Read())
+                known.Rows[KnownRows.Key(r.GetString(1))] = new KnownRows.Row
+                {
+                    Id = r.GetInt64(0), MTime = r.GetInt64(2), Size = r.GetInt64(3), Fid = r.IsDBNull(4) ? 0 : r.GetInt64(4),
+                    Buried = r.GetInt64(5) == 1, Wants = r.GetInt64(6) == 1,
+                };
+            return known;
+        }
+    }
+
+    /// <summary>Marks the entry as seen by the crawl. True when its row is up to date, so it needn't be written.</summary>
+    public bool SeenUnchanged(KnownRows known, in FsEntry e, bool buried)
+    {
+        ulong key = KnownRows.Key(e.Path);
+        ref var row = ref System.Runtime.InteropServices.CollectionsMarshal.GetValueRefOrNullRef(known.Rows, key);
+        if (System.Runtime.CompilerServices.Unsafe.IsNullRef(ref row))
+        {
+            // New: the caller inserts it. Remembered, so a second visit in the same crawl (a root
+            // nested in another) doesn't insert it again.
+            known.Rows[key] = new KnownRows.Row { Seen = true, Fresh = true };
+            known.Missing = true;
+            return false;
+        }
+        known.Missing = false;
+        if (row.Fresh) return true;
+        row.Seen = true;
+        long size = e.IsDir ? 0 : e.Size;
+        if (row.MTime != e.MTime || row.Size != size || row.Buried != buried || (e.Fid != 0 && row.Fid != e.Fid)) return false;
+        // As Upsert computes it.
+        string ext = e.IsDir ? "" : e.Extension.ToLowerInvariant();
+        var kind = e.IsDir ? FileKind.Folder : ClassifyFile(e.Path, ext);
+        bool wants = !buried && WantsContent(e.Path, ext, size, kind) && !IsCloudOnly(e.Attributes);
+        if (wants != row.Wants) return false;
+        known.Unchanged++;
+        return true;
+    }
+
+    /// <summary>Deletes the known rows the crawl didn't see: gone, moved out of the search locations, or filtered out.</summary>
+    public int DeleteUnseen(KnownRows known)
+    {
+        var ids = known.Rows.Values.Where(r => !r.Seen).Select(r => r.Id).ToList();
+        int n = 0;
+        foreach (var chunk in ids.Chunk(5000)) n += DeleteWhere($"id IN ({string.Join(',', chunk)})");
+        return n;
     }
 
     internal static string NameTokens(string display, string ext)
@@ -795,6 +970,9 @@ public sealed class IndexStore : IDisposable
     {
         lock (_lock)
         {
+            _select?.Dispose();
+            _insert?.Dispose();
+            _insertName?.Dispose();
             try { Exec(_conn, "PRAGMA optimize;"); } catch (SqliteException) { }
             _conn.Dispose();
         }

@@ -113,17 +113,22 @@ public sealed class SearchEngine : IDisposable
             var nameIds = QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 3000;", ("$q", fts));
             bool capped = nameIds.Count >= 3000;
             ids.UnionWith(nameIds);
-            ids.UnionWith(QueryIds("SELECT id FROM files WHERE name_lower >= $lo AND name_lower < $hi LIMIT 300;", ("$lo", qLower), ("$hi", qLower + '￿')));
+            foreach (int buried in new[] { 0, 1 }) // one index each (IndexStore.NameIndexes)
+                ids.UnionWith(QueryIds($"SELECT id FROM files WHERE buried = {buried} AND name_lower >= $lo AND name_lower < $hi LIMIT 300;", ("$lo", qLower), ("$hi", qLower + '￿')));
             // Plain substring anywhere in the name ("port" inside "annualreport", "2026" inside
             // "v2026final"), like Everything; token matching alone can't do that. Used to run only when
             // tokens found fewer than 50 names, so a name buried among many token hits went missing.
             // A scan of every name takes ~45 ms on 400k files. Several words: each must be in the name.
+            // With "收录全部文件名" a million more names (program files, caches) would make every keystroke
+            // cost ~300 ms: the user's own files are always scanned (their own index), the rest only when
+            // the query is specific enough to find few of the user's own files.
             var subTerms = terms.Count > 1 ? terms : new List<string> { qLower };
             if (subTerms.Sum(t => t.Length) >= 2 && subTerms.Count <= 6)
             {
                 var where = string.Join(" AND ", subTerms.Select((_, i) => $"instr(name_lower, $t{i}) > 0"));
                 var args = subTerms.Select((t, i) => ($"$t{i}", (object)t.ToLowerInvariant())).ToArray();
-                var sub = QueryIds($"SELECT id FROM files WHERE {where} LIMIT 2000;", args);
+                var sub = QueryIds($"SELECT id FROM files WHERE buried = 0 AND {where} LIMIT 2000;", args);
+                if (sub.Count < limit) sub.AddRange(QueryIds($"SELECT id FROM files WHERE buried = 1 AND {where} LIMIT 2000;", args));
                 capped |= sub.Count >= 2000;
                 ids.UnionWith(sub);
             }
@@ -155,8 +160,10 @@ public sealed class SearchEngine : IDisposable
                     r.Score = r.NameMatch ? r.Score + scores[i] * 0.35 : scores[i];
                 }
 
-                // 2b. Some words in the name, the rest in the text ("课件 弗里德曼").
-                if (terms.Count > 1) AddNamePlusContent(terms, byId, ct);
+                // 2b. Some words in the name, the rest in the text ("课件 弗里德曼"). For a few words:
+                // a pasted file name splits into many short ones ("2026", "10", "03"…), and every split
+                // of those is a full-text query over very common tokens.
+                if (terms.Count is > 1 and <= 4) AddNamePlusContent(terms, byId, ct);
             }
 
             // 3. Usage: picks for this query (and longer queries starting with it) plus frecency.
@@ -266,7 +273,13 @@ public sealed class SearchEngine : IDisposable
         {
             var nameFts = TextTokenizer.ToFtsQuery(t);
             if (nameFts == null) continue;
-            foreach (var r in LoadRows(QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 2000;", ("$q", nameFts)).Where(id => !rows.ContainsKey(id))))
+            // Only names of files whose text is indexed: the rest can't hold the other words (with
+            // "收录全部文件名" most names are program files and caches without text). CROSS JOIN keeps
+            // the name matches as the outer loop: otherwise SQLite may run the match once per file.
+            foreach (var r in LoadRows(QueryIds("""
+                SELECT n.rowid FROM names_fts n CROSS JOIN files f ON f.id = n.rowid
+                WHERE names_fts MATCH $q AND f.has_content = 1 LIMIT 2000;
+                """, ("$q", nameFts)).Where(id => !rows.ContainsKey(id))))
                 rows[r.Id] = r;
         }
         foreach (var r in rows.Values)
@@ -279,7 +292,8 @@ public sealed class SearchEngine : IDisposable
             if (!byRest.TryGetValue(key, out var list)) byRest[key] = list = new List<long>();
             list.Add(r.Id);
         }
-        foreach (var (rest, ids) in byRest)
+        // The most promising splits only (most names behind them).
+        foreach (var (rest, ids) in byRest.OrderByDescending(kv => kv.Value.Count).Take(8))
         {
             ct.ThrowIfCancellationRequested();
             var restFts = TextTokenizer.ToFtsQuery(rest);
