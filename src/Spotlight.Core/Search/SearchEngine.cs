@@ -66,7 +66,7 @@ public enum SortBy { Relevance, Modified, Name, Size, Kind }
 /// <param name="ExtraNames">Also look for the query inside names indexed by "收录全部文件名" (program files,
 /// caches): a scan of a million names. The window does it as a second step, after showing the rest.</param>
 public sealed record SearchFilter(IReadOnlyCollection<FileKind>? Kinds = null, SortBy Sort = SortBy.Relevance, bool Descending = true,
-    bool AnyTerm = false, bool ExtraNames = true, bool Content = true)
+    bool AnyTerm = false, bool ExtraNames = true, bool Content = true, bool Snippets = true)
 {
     public static SearchFilter None { get; } = new();
 
@@ -148,32 +148,49 @@ public sealed class SearchEngine : IDisposable
             var clock = System.Diagnostics.Stopwatch.StartNew();
             var steps = new List<string> { $"等锁 {lockWait.TotalMilliseconds:F0}" };
             void Step(string what) { steps.Add($"{what} {clock.Elapsed.TotalMilliseconds:F0}"); clock.Restart(); }
-            var nameIds = QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 3000;", ("$q", fts));
-            Step("名称词");
-            bool capped = nameIds.Count >= 3000;
-            ids.UnionWith(nameIds);
-            foreach (int buried in new[] { 0, 1 }) // one index each (IndexStore.NameIndexes)
-                ids.UnionWith(QueryIds($"SELECT id FROM files WHERE buried = {buried} AND name_lower >= $lo AND name_lower < $hi LIMIT 300;", ("$lo", qLower), ("$hi", qLower + '￿')));
-            // Plain substring anywhere in the name ("port" inside "annualreport", "2026" inside
-            // "v2026final"), like Everything; token matching alone can't do that. Used to run only when
-            // tokens found fewer than 50 names, so a name buried among many token hits went missing.
-            // A scan of every name takes ~45 ms on 400k files. Several words: each must be in the name.
-            // With "收录全部文件名" a million more names (program files, caches) would make every keystroke
-            // cost ~300 ms: the user's own files are always scanned (their own index), the rest only when
-            // the query is specific enough to find few of the user's own files.
-            var subTerms = terms.Count > 1 ? terms : new List<string> { qLower };
-            if (subTerms.Sum(t => t.Length) >= 2 && subTerms.Count <= 6)
+            // The window searches one query in steps (names, then text, then the extras); the name
+            // candidates are found once and reused by the later steps.
+            string nameKey = any ? qLower + "any" : qLower; // 模糊匹配 finds names by any word
+            var names = _names is { } n && n.Query == nameKey && n.Limit == limit && DateTime.UtcNow - n.At < TimeSpan.FromSeconds(10) ? n : null;
+            if (names == null)
             {
-                var where = string.Join(" AND ", subTerms.Select((_, i) => $"instr(name_lower, $t{i}) > 0"));
-                var args = subTerms.Select((t, i) => ($"$t{i}", (object)t.ToLowerInvariant())).ToArray();
-                var sub = QueryIds($"SELECT id FROM files WHERE buried = 0 AND {where} LIMIT 2000;", args);
-                if (sub.Count < limit)
+                names = new NameCandidates(nameKey, limit, DateTime.UtcNow);
+                var nameIds = QueryIds("SELECT rowid FROM names_fts WHERE names_fts MATCH $q LIMIT 3000;", ("$q", fts));
+                Step("名称词");
+                names.Capped = nameIds.Count >= 3000;
+                names.Ids.UnionWith(nameIds);
+                foreach (int buried in new[] { 0, 1 }) // one index each (IndexStore.NameIndexes)
+                    names.Ids.UnionWith(QueryIds($"SELECT id FROM files WHERE buried = {buried} AND name_lower >= $lo AND name_lower < $hi LIMIT 300;", ("$lo", qLower), ("$hi", qLower + '￿')));
+                // Plain substring anywhere in the name ("port" inside "annualreport", "2026" inside
+                // "v2026final"), like Everything; token matching alone can't do that. Used to run only when
+                // tokens found fewer than 50 names, so a name buried among many token hits went missing.
+                // A scan of every name takes ~45 ms on 400k files. Several words: each must be in the name.
+                // With "收录全部文件名" a million more names (program files, caches) would make every keystroke
+                // cost ~300 ms: the user's own files are always scanned (their own index), the rest only when
+                // the query is specific enough to find few of the user's own files.
+                var subTerms = terms.Count > 1 ? terms : new List<string> { qLower };
+                if (subTerms.Sum(t => t.Length) >= 2 && subTerms.Count <= 6)
                 {
-                    if (filter.ExtraNames) sub.AddRange(QueryIds($"SELECT id FROM files WHERE buried = 1 AND {where} LIMIT 2000;", args));
-                    else results.ExtraNamesSkipped = true;
+                    names.Where = string.Join(" AND ", subTerms.Select((_, i) => $"instr(name_lower, $t{i}) > 0"));
+                    names.Args = subTerms.Select((t, i) => ($"$t{i}", (object)t.ToLowerInvariant())).ToArray();
+                    var sub = QueryIds($"SELECT id FROM files WHERE buried = 0 AND {names.Where} LIMIT 2000;", names.Args);
+                    names.FewOwn = sub.Count < limit;
+                    names.Capped |= sub.Count >= 2000;
+                    names.Ids.UnionWith(sub);
                 }
-                capped |= sub.Count >= 2000;
-                ids.UnionWith(sub);
+                _names = names;
+            }
+            ids.UnionWith(names.Ids);
+            bool capped = names.Capped;
+            if (names.FewOwn)
+            {
+                if (filter.ExtraNames)
+                {
+                    names.Extras ??= QueryIds($"SELECT id FROM files WHERE buried = 1 AND {names.Where} LIMIT 2000;", names.Args!);
+                    capped |= names.Extras.Count >= 2000;
+                    ids.UnionWith(names.Extras);
+                }
+                else results.ExtraNamesSkipped = true;
             }
             ct.ThrowIfCancellationRequested();
 
@@ -233,8 +250,9 @@ public sealed class SearchEngine : IDisposable
 
             Step("排序");
             // Snippets read each document's whole text: the first rows now, the rest when asked (FillHits).
-            foreach (var r in top.Take(SnippetsNow).Where(r => r.ContentMatch)) FillHit(r, terms);
-            var later = top.Skip(SnippetsNow).Where(r => r.ContentMatch).ToList();
+            int snippetsNow = filter.Snippets ? SnippetsNow : 0;
+            foreach (var r in top.Take(snippetsNow).Where(r => r.ContentMatch)) FillHit(r, terms);
+            var later = top.Skip(snippetsNow).Where(r => r.ContentMatch).ToList();
             if (later.Count > 0) { results.HitsPending = later; results.Terms = terms; }
             Step("摘要");
             if (any)
@@ -290,6 +308,8 @@ public sealed class SearchEngine : IDisposable
         if (_corpus.n == 0 || DateTime.UtcNow - _corpus.at > TimeSpan.FromMinutes(5))
         {
             using var c = _conn.CreateCommand();
+            // Read from ix_files_text (the documents with text only). Without it this read all 1.7
+            // million rows, seconds when not cached: the first text search every 5 minutes waited for it.
             c.CommandText = "SELECT COUNT(*), AVG(content_chars) FROM files WHERE has_content = 1;";
             using var r = c.ExecuteReader();
             if (r.Read()) _corpus = (r.GetInt64(0), r.IsDBNull(1) ? 0 : r.GetDouble(1), DateTime.UtcNow);
@@ -634,22 +654,41 @@ public sealed class SearchEngine : IDisposable
 
     private const int SnippetsNow = 12;
 
-    /// <summary>Fills in the snippets and hit counts <see cref="SearchResults.HitsPending"/> lists.</summary>
-    public void FillHits(SearchResults results, CancellationToken ct = default)
+    /// <summary>The name candidates of the last query (see SearchCore).</summary>
+    private sealed class NameCandidates(string query, int limit, DateTime at)
     {
-        if (results.HitsPending is not { Count: > 0 } rest || results.Terms == null) return;
+        public string Query { get; } = query;
+        public int Limit { get; } = limit;
+        public DateTime At { get; } = at;
+        public HashSet<long> Ids { get; } = new();
+        public bool Capped { get; set; }
+        /// <summary>Few of the user's own names hold it: the "收录全部文件名" extras are worth scanning.</summary>
+        public bool FewOwn { get; set; }
+        public string? Where { get; set; }
+        public (string, object)[]? Args { get; set; }
+        public List<long>? Extras { get; set; }
+    }
+
+    private NameCandidates? _names;
+
+    /// <summary>Fills in the snippets and hit counts <see cref="SearchResults.HitsPending"/> lists.</summary>
+    /// <param name="rows">At most this many (the first ones, in list order); the rest stay pending.</param>
+    public void FillHits(SearchResults results, CancellationToken ct = default, int rows = int.MaxValue)
+    {
+        if (results.HitsPending is not { Count: > 0 } pending || results.Terms == null) return;
+        var now = pending.Take(rows).ToList();
         try
         {
             lock (_lock)
             {
                 using var interrupt = InterruptOn(ct);
-                foreach (var r in rest)
+                foreach (var r in now)
                 {
                     ct.ThrowIfCancellationRequested();
                     FillHit(r, results.Terms);
                 }
             }
-            results.HitsPending = null;
+            results.HitsPending = pending.Count > now.Count ? pending.Skip(now.Count).ToList() : null;
         }
         catch (SqliteException e) when (e.SqliteErrorCode == SQLITE_INTERRUPT && ct.IsCancellationRequested)
         {

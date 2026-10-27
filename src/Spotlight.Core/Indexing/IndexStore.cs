@@ -340,6 +340,7 @@ public sealed class IndexStore : IDisposable
     private const string NameIndexes = """
         CREATE INDEX IF NOT EXISTS ix_files_visible ON files(name_lower) WHERE buried = 0;
         CREATE INDEX IF NOT EXISTS ix_files_buried ON files(name_lower) WHERE buried = 1;
+        CREATE INDEX IF NOT EXISTS ix_files_text ON files(content_chars) WHERE has_content = 1;
         """;
 
     /// <summary>
@@ -357,7 +358,7 @@ public sealed class IndexStore : IDisposable
                 Exec(_conn, "PRAGMA cache_size=-262144; PRAGMA wal_autocheckpoint=20000;");
                 if (empty)
                 {
-                    Exec(_conn, "DROP INDEX IF EXISTS ix_files_fid; DROP INDEX IF EXISTS ix_files_pending; DROP INDEX IF EXISTS ix_files_visible; DROP INDEX IF EXISTS ix_files_buried;");
+                    Exec(_conn, "DROP INDEX IF EXISTS ix_files_fid; DROP INDEX IF EXISTS ix_files_pending; DROP INDEX IF EXISTS ix_files_visible; DROP INDEX IF EXISTS ix_files_buried; DROP INDEX IF EXISTS ix_files_text;");
                     _indexesDropped = true;
                 }
                 return;

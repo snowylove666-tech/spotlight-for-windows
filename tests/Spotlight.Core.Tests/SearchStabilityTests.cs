@@ -126,4 +126,61 @@ public sealed class SearchStabilityTests : IDisposable
         Assert.Contains(all, r => r.Name == "other.md" && r.ContentMatch);
         Assert.Equal("okapi plan.md", all[0].Name);
     }
+
+    /// <summary>Every query a search runs on the files table uses an index: a plain scan reads all
+    /// 1.7 million rows (seconds when not cached). The corpus statistic for ranking text hits did,
+    /// and made the first text search every five minutes take up to nine seconds.</summary>
+    [Fact]
+    public void SearchQueriesNeverScanTheWholeFilesTable()
+    {
+        using (new IndexStore(Db, new Settings())) { }
+        using var conn = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=" + Db);
+        conn.Open();
+        var queries = new[]
+        {
+            "SELECT COUNT(*), AVG(content_chars) FROM files WHERE has_content = 1;",
+            "SELECT id FROM files WHERE buried = 0 AND instr(name_lower, 'x') > 0 LIMIT 2000;",
+            "SELECT id FROM files WHERE buried = 1 AND instr(name_lower, 'x') > 0 LIMIT 2000;",
+            "SELECT id FROM files WHERE buried = 0 AND name_lower >= 'a' AND name_lower < 'b' LIMIT 300;",
+            "SELECT id FROM files WHERE buried = 1 AND name_lower >= 'a' AND name_lower < 'b' LIMIT 300;",
+            "SELECT max(length(name_lower)) FROM files WHERE buried = 0;",
+        };
+        foreach (var sql in queries)
+        {
+            using var c = conn.CreateCommand();
+            c.CommandText = "EXPLAIN QUERY PLAN " + sql;
+            using var r = c.ExecuteReader();
+            var plan = new List<string>();
+            while (r.Read()) plan.Add(r.GetString(3));
+            Assert.DoesNotContain(plan, p => p == "SCAN files");
+        }
+    }
+
+    /// <summary>The window's steps reuse the name candidates: the result must equal one full search,
+    /// also when 模糊匹配 is switched between searches of the same words.</summary>
+    [Fact]
+    public void StepsGiveTheSameResultAsOneSearch()
+    {
+        var root = Path.Combine(_dir, "docs");
+        Directory.CreateDirectory(root);
+        File.WriteAllText(Path.Combine(root, "tapir budget.md"), "x");
+        File.WriteAllText(Path.Combine(root, "tapir.md"), "the budget is here");
+        File.WriteAllText(Path.Combine(root, "budget.md"), "x");
+        var s = new Settings { PauseContentIndexingOnBattery = false };
+        using (var store = new IndexStore(Db, s))
+        using (var indexer = new Indexer(store, s, new[] { root })) indexer.RunOnce();
+
+        List<string> Names(SearchResults r) => r.Select(x => x.Name).ToList();
+        using (var fresh = new SearchEngine(Db))
+        using (var stepped = new SearchEngine(Db))
+        {
+            foreach (bool any in new[] { false, true, false })
+            {
+                var f = SearchFilter.None with { AnyTerm = any };
+                stepped.Search("tapir budget", f with { Content = false, ExtraNames = false }, 60);
+                stepped.Search("tapir budget", f with { ExtraNames = false }, 60);
+                Assert.Equal(Names(fresh.Search("tapir budget", f, 60)), Names(stepped.Search("tapir budget", f, 60)));
+            }
+        }
+    }
 }

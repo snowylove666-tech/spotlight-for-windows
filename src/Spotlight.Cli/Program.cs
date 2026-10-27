@@ -57,12 +57,12 @@ if (argList[0] == "check")
     return 0;
 }
 
-// --first: what the search window shows first (without the "收录全部文件名" extras' substrings).
+// --first: what the search window shows first (names only; text and the "收录全部文件名" extras come after).
 bool firstStep = argList.Remove("--first");
 using var engine = new SearchEngine(db);
 var query = string.Join(' ', argList.Skip(1));
-var filter = SearchFilter.None with { ExtraNames = !firstStep };
-engine.Search(query, filter, settings.MaxResults); // warm-up: the launcher keeps the engine hot, so time the second run
+var filter = firstStep ? SearchFilter.None with { ExtraNames = false, Content = false, Snippets = false } : SearchFilter.None;
+engine.Search("warmup " + query.Length, filter, settings.MaxResults); // warm-up (another query: the timed one must not reuse its name candidates): the launcher keeps the engine hot, so time the second run
 var timer = Stopwatch.StartNew();
 var results = engine.Search(query, filter, settings.MaxResults);
 timer.Stop();

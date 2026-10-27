@@ -301,31 +301,15 @@ public partial class SearchWindow : Window
         Task.Delay(40, cts.Token).ContinueWith(_ =>
         {
             trace.Add($"开始 {typed.ElapsedMilliseconds}");
-            // 1. Names (not the "收录全部文件名" extras' substrings): small indexes, shown at once.
-            if (Run(filter with { ExtraNames = false, Content = false }) is not { } first) return;
-            trace.Add($"第一步完成 {typed.ElapsedMilliseconds}（{first.results.Timings}）");
-            Show(first.results, first.loosened);
-            // 2. Document text and those extras (a scan of a million names) if they could add
-            //    something, then the snippets of the rows further down.
-            var final = first.results;
-            if (first.results.ExtraNamesSkipped || first.results.ContentSkipped)
-            {
-                if (Run(filter) is not { } deep) return;
-                trace.Add($"第二步完成 {typed.ElapsedMilliseconds}（{deep.results.Timings}）");
-                // Only when the text or the extras changed something: otherwise the list would flicker for nothing.
-                bool same = deep.results.Total == first.results.Total && deep.results.Count == first.results.Count
-                    && deep.results.Select(r => (r.Id, r.ContentMatch)).SequenceEqual(first.results.Select(r => (r.Id, r.ContentMatch)));
-                if (!same)
-                {
-                    final = deep.results;
-                    Dispatcher.UIThread.Post(() =>
-                    {
-                        if (cts.IsCancellationRequested) return;
-                        ShowResults(deep.results, (Results.SelectedItem as ResultItem)?.Result.Id);
-                        if (deep.loosened) ResultCount.Text = $"没有同时含全部关键词的，以下 {deep.results.Total:N0} 项含其中部分";
-                    });
-                }
-            }
+            // The list fills in steps, each shown as soon as it is ready; a newer keystroke stops them.
+            // 1. Names (not the "收录全部文件名" extras' substrings): small indexes, ~0.1 s.
+            if (Run(filter with { ExtraNames = false, Content = false, Snippets = false }) is not { } current) return;
+            trace.Add($"名称 {typed.ElapsedMilliseconds}（{current.results.Timings}）");
+            Show(current.results, current.loosened);
+            // 2. Document text. 3. The extras (a scan of a million names), when few of the user's
+            //    own names hold the query. Each reuses the name candidates found in step 1.
+            if (current.results.ContentSkipped && !Step(filter with { ExtraNames = false, Snippets = false }, "正文")) return;
+            if (current.results.ExtraNamesSkipped && !Step(filter with { Snippets = false }, "全部文件名")) return;
             Dispatcher.UIThread.Post(() =>
             {
                 if (cts.IsCancellationRequested) return;
@@ -334,15 +318,41 @@ public partial class SearchWindow : Window
                 if (typed.ElapsedMilliseconds > 1500)
                     ErrorLog.Note($"slow search \"{query}\": complete after {typed.ElapsedMilliseconds} ms; {string.Join("; ", trace)}");
             });
-            try { _engine.FillHits(final, cts.Token); }
-            catch (OperationCanceledException) { return; }
-            catch (Exception e) { ErrorLog.Write("snippets", e); return; }
-            Dispatcher.UIThread.Post(() =>
+            // 4. Snippets and hit counts ("11 处"), each reads a document's whole text: the rows on
+            //    screen first, then the rest.
+            foreach (int rows in new[] { 12, int.MaxValue })
             {
-                if (cts.IsCancellationRequested) return;
-                foreach (var item in _items) item.Refresh();
-                UpdatePreview();
-            });
+                try { _engine.FillHits(current.results, cts.Token, rows); }
+                catch (OperationCanceledException) { return; }
+                catch (Exception e) { ErrorLog.Write("snippets", e); return; }
+                Dispatcher.UIThread.Post(() =>
+                {
+                    if (cts.IsCancellationRequested) return;
+                    foreach (var item in _items) item.Refresh();
+                    UpdatePreview();
+                });
+            }
+
+            // Runs one more step; shows it when it changed the list (else the list would flicker for nothing).
+            bool Step(SearchFilter f, string what)
+            {
+                if (Run(f) is not { } next) return false;
+                trace.Add($"{what} {typed.ElapsedMilliseconds}（{next.results.Timings}）");
+                bool same = next.results.Total == current.results.Total && next.results.Count == current.results.Count
+                    && next.results.Select(r => (r.Id, r.ContentMatch)).SequenceEqual(current.results.Select(r => (r.Id, r.ContentMatch)));
+                if (!same)
+                {
+                    var shown = next;
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (cts.IsCancellationRequested) return;
+                        ShowResults(shown.results, (Results.SelectedItem as ResultItem)?.Result.Id);
+                        if (shown.loosened) ResultCount.Text = $"没有同时含全部关键词的，以下 {shown.results.Total:N0} 项含其中部分";
+                    });
+                }
+                current = next;
+                return true;
+            }
         }, cts.Token, TaskContinuationOptions.OnlyOnRanToCompletion, TaskScheduler.Default);
 
         // A search, retried once when it fails (e.g. the index is busy for a moment); a failure is
@@ -514,8 +524,12 @@ public partial class SearchWindow : Window
         HandlerCaption.IsVisible = true;
         HandlerName.Text = item.Result.Name;
         HandlerSnippet.Inlines = Highlight(item.Result.Snippet ?? item.Result.Path, _lastQuery);
-        // Office takes a moment to start; only load the document the user stops on.
-        Task.Delay(220, cts.Token).ContinueWith(_ => Dispatcher.UIThread.Post(async () =>
+        // Office takes a moment to start; only load the document the user stops on. Its window is a
+        // child of ours on another thread, so while Office starts a document (up to seconds) Windows
+        // makes our window wait too: keystrokes stalled and searching felt slow. Start it only once
+        // typing has paused.
+        int sinceTyping = (int)(DateTime.UtcNow - _lastSearch).TotalMilliseconds;
+        Task.Delay(Math.Max(220, 800 - sinceTyping), cts.Token).ContinueWith(_ => Dispatcher.UIThread.Post(async () =>
         {
             if (cts.IsCancellationRequested || Results.SelectedItem != item || !IsVisible) return;
             _handlerStartedUntil = DateTime.UtcNow.AddSeconds(8);
