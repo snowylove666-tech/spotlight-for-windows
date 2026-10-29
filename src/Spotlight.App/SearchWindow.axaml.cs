@@ -20,6 +20,7 @@ public partial class SearchWindow : Window
     private readonly ObservableCollection<ResultItem> _items = new();
     private CancellationTokenSource? _searchCts;
     private CancellationTokenSource? _warmCts;
+    private readonly double _width; // the designed width (SearchWindow.axaml)
     private DateTime _lastSearch;
     private string _lastQuery = "";
     private CancellationTokenSource? _previewCts;
@@ -150,6 +151,17 @@ public partial class SearchWindow : Window
             }
             HideSearch();
         };
+        // A launcher isn't minimized: minimizing it (Win+D, Win+↓, "show desktop") hides it like Esc.
+        _width = Width;
+        PropertyChanged += (_, e) =>
+        {
+            if (e.Property == WindowStateProperty && WindowState == WindowState.Minimized)
+                Dispatcher.UIThread.Post(() =>
+                {
+                    WindowState = WindowState.Normal;
+                    HideSearch();
+                });
+        };
         PrevPage.Click += (_, _) => TurnPage(-1);
         NextPage.Click += (_, _) => TurnPage(+1);
         NextHit.Click += (_, _) => StepHit(+1);
@@ -190,6 +202,11 @@ public partial class SearchWindow : Window
 
     public void ShowSearch()
     {
+        // Back to its own shape whatever happened while it was away: after Win+D or Win+↓ the window
+        // came back still minimized, as a narrow strip with the search box cut off.
+        if (WindowState != WindowState.Normal) WindowState = WindowState.Normal;
+        Width = _width;
+        SizeToContent = SizeToContent.Height;
         PlaceOnActiveScreen();
         Show();
         Activate();
