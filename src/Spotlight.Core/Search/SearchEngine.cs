@@ -23,6 +23,9 @@ public sealed class SearchResult
     public int HitCount { get; set; }
     /// <summary>PDFs: the page of each occurrence, in reading order (for stepping from hit to hit).</summary>
     public IReadOnlyList<int>? HitPages { get; set; }
+    /// <summary>What was found in the text: the whole phrase, or its words when the text holds them
+    /// apart (a line break inside "19级专家"). For marking hits in the preview.</summary>
+    public List<string>? HitTerms { get; set; }
     /// <summary>With "模糊匹配": how many of the query's words this result contains (in its name or text).</summary>
     public int TermsMatched { get; set; }
     public int TermsTotal { get; set; }
@@ -65,8 +68,10 @@ public enum SortBy { Relevance, Modified, Name, Size, Kind }
 /// <param name="AnyTerm">"模糊匹配": several words match a file holding any of them; files holding more rank higher.</param>
 /// <param name="ExtraNames">Also look for the query inside names indexed by "收录全部文件名" (program files,
 /// caches): a scan of a million names. The window does it as a second step, after showing the rest.</param>
+/// <param name="Exact">A query without spaces ("19级专家") matches only that exact sequence
+/// (<see cref="TextTokenizer.IsPhrase"/>). Off: its terms anywhere (the window's fallback when nothing holds the sequence).</param>
 public sealed record SearchFilter(IReadOnlyCollection<FileKind>? Kinds = null, SortBy Sort = SortBy.Relevance, bool Descending = true,
-    bool AnyTerm = false, bool ExtraNames = true, bool Content = true, bool Snippets = true)
+    bool AnyTerm = false, bool ExtraNames = true, bool Content = true, bool Snippets = true, bool Exact = true)
 {
     public static SearchFilter None { get; } = new();
 
@@ -131,8 +136,10 @@ public sealed class SearchEngine : IDisposable
 
         var terms = TextTokenizer.QueryTerms(query);
         bool any = filter.AnyTerm && terms.Count > 1;
-        var fts = TextTokenizer.ToFtsQuery(query, any);
+        bool phrase = filter.Exact && TextTokenizer.IsPhrase(query, filter.AnyTerm);
+        var fts = phrase ? TextTokenizer.ToPhraseFts(query) : TextTokenizer.ToFtsQuery(query, any);
         if (fts == null) return results;
+        var hitTerms = phrase ? TextTokenizer.HitTerms(query) : terms;
         string qLower = query.ToLowerInvariant();
 
         long asked = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -150,7 +157,9 @@ public sealed class SearchEngine : IDisposable
             void Step(string what) { steps.Add($"{what} {clock.Elapsed.TotalMilliseconds:F0}"); clock.Restart(); }
             // The window searches one query in steps (names, then text, then the extras); the name
             // candidates are found once and reused by the later steps.
-            string nameKey = any ? qLower + "any" : qLower; // 模糊匹配 finds names by any word
+            // Valid while the index is unchanged (data_version moves when the indexer commits).
+            long version = DataVersion();
+            string nameKey = qLower + (any ? "|any" : phrase ? "|phrase" : "") + "|" + version; // each finds other names
             var names = _names is { } n && n.Query == nameKey && n.Limit == limit && DateTime.UtcNow - n.At < TimeSpan.FromSeconds(10) ? n : null;
             if (names == null)
             {
@@ -168,7 +177,7 @@ public sealed class SearchEngine : IDisposable
                 // With "收录全部文件名" a million more names (program files, caches) would make every keystroke
                 // cost ~300 ms: the user's own files are always scanned (their own index), the rest only when
                 // the query is specific enough to find few of the user's own files.
-                var subTerms = terms.Count > 1 ? terms : new List<string> { qLower };
+                var subTerms = terms.Count > 1 && !phrase ? terms : new List<string> { qLower };
                 if (subTerms.Sum(t => t.Length) >= 2 && subTerms.Count <= 6)
                 {
                     names.Where = string.Join(" AND ", subTerms.Select((_, i) => $"instr(name_lower, $t{i}) > 0"));
@@ -199,7 +208,7 @@ public sealed class SearchEngine : IDisposable
             Step($"载入{ids.Count}");
             foreach (var r in byId.Values)
             {
-                r.Score = NameScore(r, qLower, terms);
+                r.Score = NameScore(r, qLower, terms, phrase);
                 if (any && r.Score <= 200) r.Score = AnyTermNameScore(r, terms);
                 r.NameMatch = r.Score > 0;
             }
@@ -211,11 +220,14 @@ public sealed class SearchEngine : IDisposable
             if (terms.Sum(t => t.Length) >= 2 && !filter.Content) results.ContentSkipped = true;
             else if (terms.Sum(t => t.Length) >= 2)
             {
-                var hits = QueryHits("SELECT rowid, bm25(content_fts) FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 1000;", fts);
+                // The window's later step (the extras) asks again for the same text matches.
+                var hits = _content is { } known && known.Fts == fts && known.Version == version && DateTime.UtcNow - known.At < TimeSpan.FromSeconds(10) ? known.Hits
+                    : QueryHits("SELECT rowid, bm25(content_fts) FROM content_fts WHERE content_fts MATCH $q ORDER BY rank LIMIT 1000;", fts);
                 ct.ThrowIfCancellationRequested();
+                _content = (fts, version, DateTime.UtcNow, hits);
                 capped |= hits.Count >= 1000;
                 foreach (var r in LoadRows(hits.Select(h => h.id).Where(id => !byId.ContainsKey(id)))) byId[r.Id] = r;
-                var scores = ContentScores(hits, byId, terms.Count == 1 ? fts : null);
+                var scores = ContentScores(hits, byId, terms.Count == 1 || phrase ? fts : null); // bm25() counts a phrase as one term
                 if (any) WeighByWordsFound(hits, scores, terms, byId);
                 for (int i = 0; i < hits.Count; i++)
                 {
@@ -228,7 +240,7 @@ public sealed class SearchEngine : IDisposable
                 // 2b. Some words in the name, the rest in the text ("课件 弗里德曼"). For a few words:
                 // a pasted file name splits into many short ones ("2026", "10", "03"…), and every split
                 // of those is a full-text query over very common tokens.
-                if (terms.Count is > 1 and <= 4) AddNamePlusContent(terms, byId, ct);
+                if (!phrase && terms.Count is > 1 and <= 4) AddNamePlusContent(terms, byId, ct);
             }
 
             // 3. Usage: picks for this query (and longer queries starting with it) plus frecency.
@@ -251,9 +263,9 @@ public sealed class SearchEngine : IDisposable
             Step("排序");
             // Snippets read each document's whole text: the first rows now, the rest when asked (FillHits).
             int snippetsNow = filter.Snippets ? SnippetsNow : 0;
-            foreach (var r in top.Take(snippetsNow).Where(r => r.ContentMatch)) FillHit(r, terms);
+            foreach (var r in top.Take(snippetsNow).Where(r => r.ContentMatch)) FillHit(r, hitTerms);
             var later = top.Skip(snippetsNow).Where(r => r.ContentMatch).ToList();
-            if (later.Count > 0) { results.HitsPending = later; results.Terms = terms; }
+            if (later.Count > 0) { results.HitsPending = later; results.Terms = hitTerms; }
             Step("摘要");
             if (any)
                 foreach (var r in top)
@@ -415,7 +427,7 @@ public sealed class SearchEngine : IDisposable
         }
     }
 
-    internal static double NameScore(SearchResult r, string q, List<string> terms)
+    internal static double NameScore(SearchResult r, string q, List<string> terms, bool phrase = false)
     {
         string name = r.Name.ToLowerInvariant();
         string stem = System.IO.Path.GetFileNameWithoutExtension(name);
@@ -427,12 +439,16 @@ public sealed class SearchEngine : IDisposable
         if (stem.StartsWith(q, StringComparison.Ordinal)) return 800 + 100 * ratio;
         if (WordPrefix(stem, q)) return 650 + 100 * ratio;
         if (stem.Contains(q, StringComparison.Ordinal)) return 520 + 80 * ratio;
+        // The exact sequence only, though spaces or punctuation may differ ("19 级专家", "dgx_spark").
+        if (phrase) return Compact(name).Contains(Compact(q), StringComparison.Ordinal) ? 470 + 80 * ratio : 0;
         if (terms.Count > 1 && terms.All(t => name.Contains(t, StringComparison.Ordinal))) return 470 + 80 * ratio;
         if (Initials(r.Name).StartsWith(q, StringComparison.Ordinal) && q.Length >= 2) return 600 + 50 * ratio;
         if (terms.All(t => name.Contains(t, StringComparison.Ordinal))) return 420;
         // Matched through tokens only (e.g. the extension "pdf"): weak.
         return terms.Any(t => name.Contains(t, StringComparison.Ordinal)) ? 200 : 0;
     }
+
+    private static string Compact(string s) => string.Concat(TextTokenizer.QueryTerms(s));
 
     private static bool WordPrefix(string name, string q)
     {
@@ -587,6 +603,8 @@ public sealed class SearchEngine : IDisposable
         c.Parameters.AddWithValue("$id", r.Id);
         if (c.ExecuteScalar() is not byte[] data) return;
         var text = IndexStore.Decompress(data);
+        terms = Found(text, terms);
+        r.HitTerms = terms;
         r.Snippet = Snippet(text, terms);
         r.HitCount = CountHits(text, terms);
         // Indexes built before 0.4.0 kept no newlines; the app then looks the page up in the PDF itself.
@@ -615,9 +633,16 @@ public sealed class SearchEngine : IDisposable
         return n;
     }
 
+    /// <summary>The phrase of an exact query (<see cref="TextTokenizer.HitTerms"/>) when the text holds
+    /// it as typed, else its words: the text index also matches it across a line break or a space.</summary>
+    public static List<string> Found(string text, List<string> terms) =>
+        terms.Count == 1 && text.IndexOf(terms[0], StringComparison.OrdinalIgnoreCase) < 0 && TextTokenizer.QueryTerms(terms[0]) is { Count: > 1 } words
+            ? words : terms;
+
     /// <summary>Start of each occurrence of the terms, in text order (at most <paramref name="max"/>).</summary>
     public static List<int> HitOffsets(string text, List<string> terms, int max)
     {
+        terms = Found(text, terms);
         var all = new List<int>();
         foreach (var t in terms.Where(t => t.Length > 0))
             for (int i = text.IndexOf(t, StringComparison.OrdinalIgnoreCase); i >= 0 && all.Count < max * 4; i = text.IndexOf(t, i + t.Length, StringComparison.OrdinalIgnoreCase))
@@ -670,6 +695,14 @@ public sealed class SearchEngine : IDisposable
     }
 
     private NameCandidates? _names;
+    private (string Fts, long Version, DateTime At, List<(long id, double bm25)> Hits)? _content;
+
+    private long DataVersion()
+    {
+        using var c = _conn.CreateCommand();
+        c.CommandText = "PRAGMA data_version;";
+        return Convert.ToInt64(c.ExecuteScalar());
+    }
 
     /// <summary>Fills in the snippets and hit counts <see cref="SearchResults.HitsPending"/> lists.</summary>
     /// <param name="rows">At most this many (the first ones, in list order); the rest stay pending.</param>

@@ -322,7 +322,7 @@ public partial class SearchWindow : Window
             // 1. Names (not the "收录全部文件名" extras' substrings): small indexes, ~0.1 s.
             if (Run(filter with { ExtraNames = false, Content = false, Snippets = false }) is not { } current) return;
             trace.Add($"名称 {typed.ElapsedMilliseconds}（{current.results.Timings}）");
-            Show(current.results, current.loosened);
+            Show(current.results, current.loose, current.note);
             // 2. Document text. 3. The extras (a scan of a million names), when few of the user's
             //    own names hold the query. Each reuses the name candidates found in step 1.
             if (current.results.ContentSkipped && !Step(filter with { ExtraNames = false, Snippets = false }, "正文")) return;
@@ -364,7 +364,8 @@ public partial class SearchWindow : Window
                     {
                         if (cts.IsCancellationRequested) return;
                         ShowResults(shown.results, (Results.SelectedItem as ResultItem)?.Result.Id);
-                        if (shown.loosened) ResultCount.Text = $"没有同时含全部关键词的，以下 {shown.results.Total:N0} 项含其中部分";
+                        _lastLoose = shown.loose;
+                        if (shown.note != null) ResultCount.Text = string.Format(shown.note, shown.results.Total);
                     });
                 }
                 current = next;
@@ -374,7 +375,8 @@ public partial class SearchWindow : Window
 
         // A search, retried once when it fails (e.g. the index is busy for a moment); a failure is
         // logged and shown instead of leaving the window empty.
-        (SearchResults results, bool loosened)? Run(SearchFilter f)
+        // note: the line shown instead of the count when the query had to be loosened to find anything.
+        (SearchResults results, bool loose, string? note)? Run(SearchFilter f)
         {
             for (int attempt = 1; ; attempt++)
             {
@@ -384,12 +386,18 @@ public partial class SearchWindow : Window
                     if (attempt > 1) trace.Add($"重试成功 {typed.ElapsedMilliseconds}");
                     // Nothing holds every word: show what holds some of them rather than an empty window.
                     // (Not before the text was searched too: it may hold them all.)
+                    if (results.Count == 0 && f.Exact && f.Content && TextTokenizer.IsPhrase(query, f.AnyTerm))
+                    {
+                        // Nothing holds "19级专家" as typed: what holds "19" and "级专家" apart.
+                        results = _engine.Search(query, f with { Exact = false }, _settings.MaxResults, cts.Token);
+                        if (results.Count > 0) return (results, true, "没有完全一致的，以下 {0:N0} 项含全部关键词（不相连）");
+                    }
                     if (results.Count == 0 && !f.AnyTerm && f.Content && TextTokenizer.QueryTerms(query).Count > 1)
                     {
                         results = _engine.Search(query, f with { AnyTerm = true }, _settings.MaxResults, cts.Token);
-                        return (results, results.Count > 0);
+                        if (results.Count > 0) return (results, true, "没有同时含全部关键词的，以下 {0:N0} 项含其中部分");
                     }
-                    return (results, false);
+                    return (results, false, null);
                 }
                 catch (OperationCanceledException) { return null; }
                 catch (Exception e)
@@ -407,15 +415,16 @@ public partial class SearchWindow : Window
             }
         }
 
-        void Show(SearchResults results, bool loosened) => Dispatcher.UIThread.Post(() =>
+        void Show(SearchResults results, bool loose, string? note) => Dispatcher.UIThread.Post(() =>
         {
             if (cts.IsCancellationRequested) return;
             if (typed.ElapsedMilliseconds > 500)
                 ErrorLog.Note($"slow search \"{query}\": shown after {typed.ElapsedMilliseconds} ms; {string.Join("; ", trace)}; 界面线程接手 {typed.ElapsedMilliseconds}");
             if (!_noticeSticky) Notice.IsVisible = false;
             _lastQuery = query;
+            _lastLoose = loose;
             ShowResults(results);
-            if (loosened) ResultCount.Text = $"没有同时含全部关键词的，以下 {results.Total:N0} 项含其中部分";
+            if (note != null) ResultCount.Text = string.Format(note, results.Total);
             if (_openWhenReady is { } reveal) { _openWhenReady = null; OpenSelected(reveal); }
         });
     }
@@ -473,7 +482,7 @@ public partial class SearchWindow : Window
         PreviewName.Text = r.Kind == FileKind.Calculator ? r.Value : r.Name;
         PreviewDetails.Text = item.Details;
         PreviewPath.Text = r.Path;
-        PreviewSnippet.Inlines = Highlight(r.Snippet ?? "", _lastQuery);
+        PreviewSnippet.Inlines = Highlight(r.Snippet ?? "", HitTerms(r));
         PreviewSnippet.IsVisible = !string.IsNullOrEmpty(r.Snippet);
         if (item.Icon == null)
             item.PropertyChanged += (_, _) => { if (Results.SelectedItem == item) { PreviewIcon.Source = item.Icon; PreviewGlyph.Text = ""; } };
@@ -499,7 +508,7 @@ public partial class SearchWindow : Window
         var r = item.Result;
         if (r.Kind == FileKind.Calculator || PagePreview.IsCloudOnly(r.Path)) return;
         // Only content hits have words worth marking; a name match shows the first page.
-        var terms = r.ContentMatch ? TextTokenizer.QueryTerms(_lastQuery) : new List<string>();
+        var terms = r.ContentMatch ? HitTerms(r) : new List<string>();
         if (allowHandler && UsesHandler(r)) { LoadHandler(item, cts); return; }
         if (SheetPreview.CanPreview(r.Path)) { LoadSheet(item, terms, cts, _hitIndex); return; }
         if (r.Kind is FileKind.Text or FileKind.Code || System.IO.Path.GetExtension(r.Path).Equals(".csv", StringComparison.OrdinalIgnoreCase))
@@ -540,7 +549,7 @@ public partial class SearchWindow : Window
         Handler.IsVisible = true;
         HandlerCaption.IsVisible = true;
         HandlerName.Text = item.Result.Name;
-        HandlerSnippet.Inlines = Highlight(item.Result.Snippet ?? item.Result.Path, _lastQuery);
+        HandlerSnippet.Inlines = Highlight(item.Result.Snippet ?? item.Result.Path, HitTerms(item.Result));
         // Office takes a moment to start; only load the document the user stops on. Its window is a
         // child of ours on another thread, so while Office starts a document (up to seconds) Windows
         // makes our window wait too: keystrokes stalled and searching felt slow. Start it only once
@@ -688,7 +697,7 @@ public partial class SearchWindow : Window
     private void JumpToHit(int step)
     {
         if (_preview is not { Page: { } page } || _previewItem is not { } item || !item.Result.ContentMatch) return;
-        var terms = TextTokenizer.QueryTerms(_lastQuery);
+        var terms = HitTerms(item.Result);
         var path = item.Result.Path;
         PageLabel.Text = "正在查找…";
         _ = Task.Run(() =>
@@ -874,7 +883,7 @@ public partial class SearchWindow : Window
             if (_sheetBusy) return; // still reading for the previous press
             _sheetBusy = true;
             HitInfo.Text = "正在查找…";
-            var terms = TextTokenizer.QueryTerms(_lastQuery);
+            var terms = HitTerms(r);
             var path = r.Path;
             _ = Task.Run(() =>
             {
@@ -909,7 +918,7 @@ public partial class SearchWindow : Window
     private void ShowIndexedText(ResultItem item)
     {
         var id = item.Result.Id;
-        var terms = TextTokenizer.QueryTerms(_lastQuery);
+        var terms = HitTerms(item.Result);
         HitInfo.Text = "正在载入文字版…";
         _ = Task.Run(() =>
         {
@@ -946,7 +955,7 @@ public partial class SearchWindow : Window
     {
         if (_text == null) return;
         int at = _hitIndex < _textHits.Count ? _textHits[_hitIndex] : -1;
-        PreviewText.Inlines = Highlight(PagePreview.TextWindow(_text, at, out int local), _lastQuery, local);
+        PreviewText.Inlines = Highlight(PagePreview.TextWindow(_text, at, out int local), _previewItem is { } shown ? HitTerms(shown.Result) : TextTokenizer.QueryTerms(_lastQuery), local);
         PreviewScroll.Offset = default;
     }
 
@@ -985,11 +994,19 @@ public partial class SearchWindow : Window
         _previewItem = null;
     }
 
+    /// <summary>The query found loosely (its words apart, or only some of them) rather than as typed.</summary>
+    private bool _lastLoose;
+
+    /// <summary>What to mark in a result's text: what the search found there (the exact phrase of a
+    /// query typed without spaces, else its words).</summary>
+    private List<string> HitTerms(SearchResult r) =>
+        r.HitTerms ?? (_lastLoose ? TextTokenizer.QueryTerms(_lastQuery) : TextTokenizer.HitTerms(_lastQuery, _settings.MatchAnyTerm));
+
     /// <summary>Bolds every occurrence of the query terms inside the snippet.</summary>
-    private static InlineCollection Highlight(string text, string query, int current = -1)
+    private static InlineCollection Highlight(string text, List<string> hitTerms, int current = -1)
     {
         var inlines = new InlineCollection();
-        var terms = TextTokenizer.QueryTerms(query).Where(t => t.Length > 0).ToList();
+        var terms = SearchEngine.Found(text, hitTerms).Where(t => t.Length > 0).ToList();
         int i = 0;
         while (i < text.Length)
         {
@@ -1090,7 +1107,7 @@ public partial class SearchWindow : Window
             {
                 // Open at the page on screen (the hit, or where the user turned to), else the indexed one.
                 int? page = (_previewItem == item ? _preview?.Page : null) ?? r.Page;
-                var term = TextTokenizer.QueryTerms(_lastQuery).OrderByDescending(t => t.Length).FirstOrDefault();
+                var term = HitTerms(r).OrderByDescending(t => t.Length).FirstOrDefault();
                 Platform.OpenAt(r.Path, page, term);
             }
             else Platform.Open(r.Path);

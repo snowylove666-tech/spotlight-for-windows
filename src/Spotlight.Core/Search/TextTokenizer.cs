@@ -155,5 +155,44 @@ public static class TextTokenizer
         return string.Join(anyTerm ? " OR " : " AND ", parts);
     }
 
+    /// <summary>
+    /// A query typed without spaces that still splits into several terms ("19级专家", "DGX-Spark")
+    /// means exactly that sequence: "19" and "级专家" somewhere apart in a document is not a match.
+    /// Spaces ("19级 专家") or "模糊匹配" ask for the words separately.
+    /// </summary>
+    public static bool IsPhrase(string query, bool anyTerm = false)
+    {
+        query = query.Trim();
+        return !anyTerm && !query.Any(char.IsWhiteSpace) && QueryTerms(query).Count > 1;
+    }
+
+    /// <summary>The FTS5 phrase for <see cref="IsPhrase"/> queries: the tokens <see cref="ForIndex"/>
+    /// writes for that text, in a row. A CJK run is followed by its trailing single character when
+    /// more follows it in the query; a last Latin term is a prefix (the user may still be typing it).</summary>
+    public static string ToPhraseFts(string query)
+    {
+        var terms = QueryTerms(query);
+        var tokens = new List<string>();
+        for (int i = 0; i < terms.Count; i++)
+        {
+            var t = terms[i];
+            bool last = i == terms.Count - 1;
+            if (!IsCjk(t[0])) tokens.Add(t);
+            else if (t.Length == 1) tokens.Add(t);
+            else
+            {
+                for (int k = 0; k + 1 < t.Length; k++) tokens.Add(t.Substring(k, 2));
+                if (!last) tokens.Add(t[^1].ToString());
+            }
+        }
+        bool prefix = !IsCjk(terms[^1][0]) || terms[^1].Length == 1;
+        return Quote(string.Join(' ', tokens)) + (prefix ? "*" : "");
+    }
+
+    /// <summary>What to look for (and mark) inside a matching document: the whole phrase for
+    /// <see cref="IsPhrase"/> queries, else each term.</summary>
+    public static List<string> HitTerms(string query, bool anyTerm = false) =>
+        IsPhrase(query, anyTerm) ? new List<string> { query.Trim().ToLowerInvariant() } : QueryTerms(query);
+
     private static string Quote(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
 }

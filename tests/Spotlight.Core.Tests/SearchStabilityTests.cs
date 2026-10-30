@@ -156,6 +156,43 @@ public sealed class SearchStabilityTests : IDisposable
         }
     }
 
+    /// <summary>A query typed without spaces ("19级专家") means that exact sequence: a document with "19"
+    /// on one page and "级专家" on another is no match, and the hits inside a match are the sequence,
+    /// not every "19". With a space the words match anywhere, as before.</summary>
+    [Fact]
+    public void AQueryWithoutSpacesMatchesTheExactSequence()
+    {
+        var root = Path.Combine(_dir, "docs");
+        Directory.CreateDirectory(root);
+        File.WriteAllText(Path.Combine(root, "apart.md"), "第19页\n这位高级专家说");
+        File.WriteAllText(Path.Combine(root, "exact.md"), "见第19页。\n材料对照华为19级专家约3天");
+        File.WriteAllText(Path.Combine(root, "wrapped.md"), "华为19\n级专家");
+        File.WriteAllText(Path.Combine(root, "19级专家名单.md"), "x");
+        var s = new Settings { PauseContentIndexingOnBattery = false };
+        using (var store = new IndexStore(Db, s))
+        using (var indexer = new Indexer(store, s, new[] { root })) indexer.RunOnce();
+
+        using var engine = new SearchEngine(Db);
+        var exact = engine.Search("19级专家", limit: 60);
+        Assert.Equal(new[] { "19级专家名单.md", "exact.md", "wrapped.md" }, exact.Select(r => r.Name).OrderBy(n => n, StringComparer.Ordinal));
+        Assert.Equal("19级专家名单.md", exact[0].Name);
+        var doc = exact.Single(r => r.Name == "exact.md");
+        Assert.Equal(1, doc.HitCount);
+        Assert.Contains("华为19级专家", doc.Snippet);
+        // Across a line break the index still matches; the words are marked then.
+        Assert.Equal(new[] { "19", "级专家" }, exact.Single(r => r.Name == "wrapped.md").HitTerms);
+
+        var words = engine.Search("19 级专家", limit: 60);
+        Assert.Contains(words, r => r.Name == "apart.md");
+        var loose = engine.Search("19级专家", SearchFilter.None with { Exact = false }, 60);
+        Assert.Contains(loose, r => r.Name == "apart.md");
+
+        Assert.Equal("\"19 级专 专家\"", TextTokenizer.ToPhraseFts("19级专家"));
+        Assert.Equal("\"专家 家 19\"*", TextTokenizer.ToPhraseFts("专家19"));
+        Assert.False(TextTokenizer.IsPhrase("19级专家", anyTerm: true));
+        Assert.False(TextTokenizer.IsPhrase("专家"));
+    }
+
     /// <summary>The window's steps reuse the name candidates: the result must equal one full search,
     /// also when 模糊匹配 is switched between searches of the same words.</summary>
     [Fact]

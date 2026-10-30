@@ -4,6 +4,7 @@ using System.Runtime.InteropServices.ComTypes;
 using System.Runtime.Versioning;
 using Avalonia.Controls;
 using Avalonia.Platform;
+using Spotlight.Core;
 
 namespace Spotlight.App;
 
@@ -22,8 +23,10 @@ internal sealed class PreviewHandlerHost : NativeControlHost
     private IntPtr _hwnd;
     private PreviewSession? _session;
 
-    /// <summary>Handlers that did not answer in time; not tried again until the app restarts.</summary>
-    private static readonly ConcurrentDictionary<Guid, bool> Unresponsive = new();
+    /// <summary>Handlers that did not answer in time, and until when they are not tried (a thumbnail
+    /// is shown instead). Used to be until the app restarted: PowerPoint starting cold once (it can
+    /// take longer than the wait) then meant no presentation preview for the rest of the day.</summary>
+    private static readonly ConcurrentDictionary<Guid, DateTime> Unresponsive = new();
 
     public PreviewHandlerHost() => SizeChanged += (_, _) => _session?.Resize();
 
@@ -36,7 +39,7 @@ internal sealed class PreviewHandlerHost : NativeControlHost
         var sb = new System.Text.StringBuilder((int)size);
         // ASSOCF_INIT_DEFAULTTOSTAR | ASSOCF_NOTRUNCATE; ASSOCSTR_SHELLEXTENSION = 16
         if (AssocQueryString(0x4 | 0x20, 16, ext, PreviewHandlerIid, sb, ref size) != 0) return null;
-        return Guid.TryParse(sb.ToString(), out var g) && !Unresponsive.ContainsKey(g) ? g : null;
+        return Guid.TryParse(sb.ToString(), out var g) && !(Unresponsive.TryGetValue(g, out var until) && DateTime.UtcNow < until) ? g : null;
     }
 
     public bool HasWindow => _hwnd != IntPtr.Zero;
@@ -48,9 +51,15 @@ internal sealed class PreviewHandlerHost : NativeControlHost
         Unload();
         if (_hwnd == IntPtr.Zero || HandlerFor(path) is not { } clsid) return false;
         var session = _session = new PreviewSession(clsid, path, _hwnd);
-        var finished = await Task.WhenAny(session.Shown, Task.Delay(TimeSpan.FromSeconds(6)));
+        // Office starting its program for the first preview takes several seconds.
+        var finished = await Task.WhenAny(session.Shown, Task.Delay(TimeSpan.FromSeconds(12)));
         if (finished == session.Shown && session.Shown.Result) return _session == session;
-        if (finished != session.Shown) Unresponsive[clsid] = true;
+        if (finished != session.Shown)
+        {
+            Unresponsive[clsid] = DateTime.UtcNow.AddMinutes(1);
+            ErrorLog.Note($"preview handler {clsid} took over 12 s for \"{Path.GetFileName(path)}\"; thumbnails for a minute");
+        }
+        else if (session.Error is { } e) ErrorLog.Note($"preview handler {clsid} failed for \"{Path.GetFileName(path)}\": 0x{e.HResult:X8} {e.Message}");
         if (_session == session) Unload();
         return false;
     }
@@ -130,6 +139,7 @@ internal sealed class PreviewHandlerHost : NativeControlHost
         private volatile bool _closed;
 
         public Task<bool> Shown => _shown.Task;
+        public Exception? Error { get; private set; }
 
         public PreviewSession(Guid clsid, string path, IntPtr hwnd)
         {
@@ -154,7 +164,7 @@ internal sealed class PreviewHandlerHost : NativeControlHost
             try
             {
                 handler = Create(clsid, path);
-                if (handler == null || _closed) { _shown.TrySetResult(false); return; }
+                if (handler == null || _closed) { if (handler == null) Error = new InvalidOperationException("not created (no IInitializeWithFile/Stream)"); _shown.TrySetResult(false); return; }
                 GetClientRect(_hwnd, out var rect);
                 handler.SetWindow(_hwnd, ref rect);
                 handler.DoPreview();
@@ -171,7 +181,7 @@ internal sealed class PreviewHandlerHost : NativeControlHost
                     DispatchMessage(ref msg);
                 }
             }
-            catch (Exception) { _shown.TrySetResult(false); }
+            catch (Exception e) { Error = e; _shown.TrySetResult(false); }
             finally
             {
                 if (handler != null)
